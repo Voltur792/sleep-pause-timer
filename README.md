@@ -52,16 +52,6 @@ pyinstaller sleep_pause.spec --noconfirm
 `sleep_pause.spec` автоматически подхватывает `app_icon.ico` / `app_icon.png`
 из папки сборки (иконка окна и файла).
 
-## Сборка релиза
-
-CI (`.github/workflows/release.yml`) собирает exe на Windows-раннере
-и прикрепляет zip к релизу. Чтобы выпустить версию:
-
-```powershell
-git tag v1.0.1
-git push origin v1.0.1
-```
-
 ## Лицензия
 
 [MIT](LICENSE) © Voltur
