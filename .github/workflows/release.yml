@@ -1,0 +1,38 @@
+# Собирает sleep_pause.exe через PyInstaller и прикрепляет zip к релизу.
+# Релиз создаётся пушем тега v* (см. README → «Сборка релиза»).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: pyinstaller sleep_pause.spec --noconfirm
+
+      - name: Zip the exe
+        run: Compress-Archive -Path dist/sleep_pause.exe -DestinationPath "SleepPauseTimer-${{ github.ref_name }}-windows-x64.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} --verify-tag --title "Sleep Pause Timer ${{ github.ref_name }}" --generate-notes
+          gh release upload ${{ github.ref_name }} "SleepPauseTimer-${{ github.ref_name }}-windows-x64.zip"

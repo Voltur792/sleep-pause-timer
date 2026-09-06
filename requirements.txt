@@ -1,0 +1,6 @@
+pyautogui
+pygetwindow
+pystray
+pillow
+psutil
+pywin32
