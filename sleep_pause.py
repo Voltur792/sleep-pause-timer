@@ -182,6 +182,11 @@ class SleepPauseApp:
         # Для детекта окон: список заголовков, индексируемый с 1
         self.detected_windows = []  # list of strings
 
+        # Для отслеживания бездействия мыши/клавиатуры
+        self.idle_stop_event = threading.Event()
+        self.idle_counter_thread = None
+        self.idle_alert_window = None
+
         # Load icon - используем большой размер для панели задач (512 для высокого DPI)
         self.app_icon_img = load_app_icon()
         
@@ -292,8 +297,26 @@ class SleepPauseApp:
                  fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w")
         
         self.win_title_entry = tk.Entry(self.settings_card, font=("Segoe UI", 10),
-                                        bg=self.entry_bg, fg=self.input_fg, bd=0, relief="flat")
+                                         bg=self.entry_bg, fg=self.input_fg, bd=0, relief="flat")
         self.win_title_entry.pack(fill="x", pady=(5, 0), ipady=5)
+
+        # --- Бездействие ---
+        tk.Label(self.settings_card, text="⏳ Бездействие (минуты, 0 = выкл)", bg=self.frame_bg,
+                 fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w", pady=(10, 0))
+        
+        idle_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
+        idle_frame.pack(fill="x", pady=(5, 0))
+        
+        self.idle_spin = tk.Spinbox(idle_frame, from_=1, to=120, width=5,
+                                     font=("Segoe UI", 10, "bold"), justify="center",
+                                     bg=self.entry_bg, fg=self.input_fg, bd=0,
+                                     relief="flat", takefocus=0)
+        self.idle_spin.insert(0, "0")
+        self.idle_spin.pack(side="left")
+        
+        self.idle_label = tk.Label(idle_frame, text="мин", bg=self.frame_bg,
+                                    fg=self.label_fg, font=("Segoe UI", 9))
+        self.idle_label.pack(side="left", padx=(4, 0))
 
         # Кнопки
         self.btn_frame = tk.Frame(frm, bg=self.main_bg)
@@ -353,6 +376,11 @@ class SleepPauseApp:
 
         # Сброс кнопок при потере фокуса окном (клик на рабочий стол)
         root.bind("<FocusOut>", lambda e: self._reset_all_buttons())
+        
+        # Сброс таймера бездействия при активности
+        root.bind("<Motion>", self._reset_idle_counter)
+        root.bind("<Key>", self._reset_idle_counter)
+        root.bind("<Button>", self._reset_idle_counter)
 
     # ---------- UI helpers ----------
     def _hex_to_rgb(self, value):
@@ -506,6 +534,197 @@ class SleepPauseApp:
             # Возвращаем к состоянию "над кнопкой"
             button.config(relief="raised")
             self._animate_button_to(button, button._hover_bg, steps=4, delay=14)
+
+    # ---------- Idle (бездействие) ----------
+    def _reset_idle_counter(self, event=None):
+        """Сброс таймера бездействия при любом действии мыши/клавиатуры."""
+        if self.idle_alert_window is not None:
+            return  # уже показываем предупреждение — игнорируем
+        self.idle_stop_event.clear()
+
+    def _start_idle_counter(self):
+        """Запуск потока отслеживания бездействия."""
+        idle_minutes = 0
+        try:
+            idle_minutes = int(self.idle_spin.get())
+        except ValueError:
+            pass
+        if idle_minutes <= 0:
+            return  # функция отключена
+        
+        self.idle_stop_event.clear()
+        
+        def thread():
+            user32 = ctypes.windll.user32
+            LAST_INPUT_SIZE = ctypes.sizeof(ctypes.c_uint64)
+            
+            while not self.idle_stop_event.is_set():
+                # Ждём 1 секунду
+                if self.idle_stop_event.wait(1.0):
+                    break  # остановка
+                
+                # Получаем время последнего ввода
+                last_input = ctypes.c_uint64(0)
+                try:
+                    user32.GetLastInputInfo(ctypes.byref(last_input))
+                    now = ctypes.windll.kernel32.GetTickCount64()
+                    idle_ms = now - last_input.value
+                    idle_secs = idle_ms / 1000.0
+                except Exception:
+                    continue
+                
+                # Проверяем порог
+                if idle_secs >= idle_minutes * 60:
+                    # Время бездействия истекло — выполняем действие
+                    self.root.after(0, self._on_idle_timeout)
+                    break
+                
+                # Показываем предупреждение за 5 минут до истечения
+                time_left = (idle_minutes * 60) - idle_secs
+                if 0 < time_left <= 300:  # 5 минут = 300 сек
+                    if self.idle_alert_window is None:
+                        self.root.after(0, self._show_idle_alert, idle_minutes)
+                        break
+        
+        self.idle_counter_thread = threading.Thread(target=thread, daemon=True)
+        self.idle_counter_thread.start()
+
+    def _stop_idle_counter(self):
+        """Остановка потока отслеживания бездействия."""
+        self.idle_stop_event.set()
+        self.idle_counter_thread = None
+        # Закрываем предупреждение если есть
+        if self.idle_alert_window is not None:
+            try:
+                self.idle_alert_window.destroy()
+            except Exception:
+                pass
+            self.idle_alert_window = None
+
+    def _show_idle_alert(self, idle_minutes):
+        """Показывает предупреждение за 5 минут до срабатывания бездействия."""
+        try:
+            # Звуковой сигнал
+            try:
+                ctypes.windll.user32.MessageBeep(ctypes.c_uint(-1))
+            except Exception:
+                pass
+            
+            # Создаём окно предупреждения
+            alert = tk.Toplevel(self.root)
+            alert.title("⏳ Предупреждение: бездействие")
+            alert.geometry("420x180")
+            alert.resizable(False, False)
+            alert.transient(self.root)
+            alert.grab_set()
+            alert.lift()
+            alert.focus_force()
+            
+            # Цвета
+            bg = self.frame_bg
+            fg = self.input_fg
+            accent = self.accent
+            warning = self.warning
+            
+            alert.configure(bg=bg)
+            
+            # Текст
+            tk.Label(alert, text="⚠️ Предупреждение", font=("Segoe UI", 14, "bold"),
+                     bg=bg, fg=warning).pack(pady=(15, 5))
+            
+            tk.Label(alert, text=f"Через 5 минут будет выполнено действие:\n{self.key_var.get()}",
+                     font=("Segoe UI", 10), bg=bg, fg=fg).pack(pady=5)
+            
+            tk.Label(alert, text="Подвигайте мышь или нажмите любую клавишу, чтобы отменить.",
+                     font=("Segoe UI", 9, "italic"), bg=bg, fg=self.label_fg).pack(pady=(5, 15))
+            
+            # Кнопки
+            btn_frame = tk.Frame(alert, bg=bg)
+            btn_frame.pack(pady=(0, 15))
+            
+            def on_cancel():
+                self.idle_alert_window = None
+                alert.destroy()
+            
+            def on_confirm():
+                self.idle_alert_window = None
+                alert.destroy()
+                # Сразу выполняем действие
+                self.root.after(0, self._on_idle_timeout)
+            
+            tk.Button(btn_frame, text="Отменить", command=on_cancel,
+                     font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8,
+                     cursor="hand2", relief="flat", bg="#1e293b", fg="white",
+                     activebackground=accent, activeforeground="white",
+                     highlightthickness=0, highlightbackground=bg, highlightcolor=bg).pack(side="left", padx=5)
+            
+            tk.Button(btn_frame, text="Выполнить сейчас", command=on_confirm,
+                     font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8,
+                     cursor="hand2", relief="flat", bg=warning, fg="white",
+                     activebackground=self._darken(warning, 0.2), activeforeground="white",
+                     highlightthickness=0, highlightbackground=bg, highlightcolor=bg).pack(side="left", padx=5)
+            
+            self.idle_alert_window = alert
+            
+            # Закрываем окно по активности
+            self.root.bind("<Motion>", lambda e: self._cancel_idle_alert(alert))
+            self.root.bind("<Key>", lambda e: self._cancel_idle_alert(alert))
+            
+        except Exception as e:
+            print(f"DEBUG: idle alert error: {e}")
+
+    def _cancel_idle_alert(self, alert):
+        """Отменяет предупреждение при активности."""
+        if self.idle_alert_window is not None:
+            self.idle_alert_window = None
+            try:
+                alert.destroy()
+            except Exception:
+                pass
+
+    def _on_idle_timeout(self):
+        """Выполняет действие при истечении времени бездействия."""
+        self._set_status("⏳ Бездействие: действие выполняется...", self.warning, pulse=False)
+        
+        # Скрываем главное окно
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        
+        # Вызываем то же действие, что и при завершении таймера
+        key = self.key_var.get()
+        title = self.win_title_entry.get().strip()
+        
+        # Выполняем действие
+        if key == "shutdown":
+            self.root.after(0, lambda: self._set_status("🔴 Выключение...", self.warning, pulse=False))
+            time.sleep(1)
+            ctypes.windll.user32.ExitWindowsEx(0x00000001 | 0x00000004, 0xFFFFFFFF)
+            return
+        
+        elif key == "sleep":
+            self.root.after(0, lambda: self._set_status("💤 Спящий режим...", self.warning, pulse=False))
+            time.sleep(1)
+            ctypes.windll.PowrProf.SetSuspendState(0, 0, 0)
+            return
+        
+        if title:
+            self._activate_window(title)
+        
+        if pyautogui is None:
+            return
+        
+        try:
+            pyautogui.press(key)
+            self.root.after(0, lambda: self._set_status("✓ Клавиша отправлена!", self.success, pulse=False))
+        except Exception as e:
+            self.root.after(0, lambda err=e: messagebox.showerror("Ошибка", f"Не удалось отправить клавишу '{key}': {err}"))
+        
+        self.root.after(0, lambda: self._set_button_state(self.btn_start, enabled=True))
+        self.root.after(0, lambda: self._set_button_state(self.btn_pause, enabled=False))
+        self.root.after(0, lambda: self._set_button_state(self.btn_cancel, enabled=False))
+        self.root.after(0, lambda: self._set_status("✓ Готово", self.success, pulse=False))
 
     def _set_button_state(self, button, enabled=True):
         if enabled:
@@ -662,6 +881,10 @@ class SleepPauseApp:
         self.progress["maximum"] = total
         self.progress["value"] = 0
         self._set_status("⏳ Таймер запущен", self.accent, pulse=True)
+        
+        # Запускаем отслеживание бездействия
+        self._start_idle_counter()
+        
         self.worker = threading.Thread(target=self._timer_thread, args=(total, key), daemon=True)
         self.worker.start()
 
@@ -670,6 +893,9 @@ class SleepPauseApp:
             self.stop_event.set()
             self._set_status("⏹ Отмена...", self.warning, pulse=False)
             self._set_button_state(self.btn_cancel, enabled=False)
+        
+        # Останавливаем отслеживание бездействия
+        self._stop_idle_counter()
 
     def toggle_pause(self):
         if not self.worker or not self.worker.is_alive():
