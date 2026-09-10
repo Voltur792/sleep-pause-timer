@@ -391,6 +391,8 @@ class SleepPauseApp:
         self.update_ui_colors()
         self._set_status("✓ Готово", self.success, pulse=False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # Кнопка «–» при активном таймере/отслеживании прячет окно в трей
+        root.bind("<Unmap>", self._on_root_unmap)
 
         # Сброс кнопок при потере фокуса окном (клик на рабочий стол)
         root.bind("<FocusOut>", lambda e: self._reset_all_buttons())
@@ -554,6 +556,17 @@ class SleepPauseApp:
             self._animate_button_to(button, button._hover_bg, steps=4, delay=14)
 
     # ---------- Idle (бездействие) ----------
+    def _ui_call(self, fn):
+        """Безопасно планирует вызов в главном потоке Tk.
+
+        Ошибки планирования (например, при закрытии окна) не должны
+        ронять поток отслеживания бездействия.
+        """
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            pass
+
     def _reset_idle_counter(self, event=None):
         """Сброс таймера бездействия при любом действии мыши/клавиатуры."""
         if self.idle_alert_window is not None:
@@ -611,21 +624,23 @@ class SleepPauseApp:
                 # Если пользователь вернулся (реальная активность, не наш ввод) — сбрасываем флаг
                 if idle_secs < 2.0 and self.idle_action_executed and not in_cooldown:
                     self.idle_action_executed = False
-                    self.root.after(0, lambda: self._set_status("✓ Вы вернулись — отслеживание продолжено", self.success, pulse=False))
+                    self._ui_call(lambda: self._set_status("✓ Вы вернулись — отслеживание продолжено", self.success, pulse=False))
                 
                 # Если предупреждение открыто и пользователь активен - закрываем его
                 if self.idle_alert_window is not None and idle_secs < 2.0 and not in_cooldown:
-                    self.root.after(0, self._cancel_idle_alert, self.idle_alert_window)
+                    alert_ref = self.idle_alert_window
+                    self._ui_call(lambda: self._cancel_idle_alert(alert_ref))
                 
                 # Проверяем порог
                 if idle_secs >= idle_minutes * 60 and not self.idle_action_executed:
                     # Время бездействия истекло — выполняем действие
                     self.idle_action_executed = True  # Устанавливаем флаг ДО нажатия
                     action_cooldown_until = time.time() + 15  # игнорируем ввод 15 сек после действия
-                    self.root.after(0, self._on_idle_timeout)
+                    self._ui_call(self._on_idle_timeout)
                     # Закрываем предупреждение если есть
                     if self.idle_alert_window is not None:
-                        self.root.after(0, self._cancel_idle_alert, self.idle_alert_window)
+                        alert_ref = self.idle_alert_window
+                        self._ui_call(lambda: self._cancel_idle_alert(alert_ref))
                     continue
                 
                 # Показываем предупреждение за 5 минут до истечения
@@ -634,7 +649,7 @@ class SleepPauseApp:
                     time_left = (idle_minutes * 60) - idle_secs
                     if 0 < time_left <= 300:  # 5 минут = 300 сек
                         if self.idle_alert_window is None:
-                            self.root.after(0, self._show_idle_alert, idle_minutes)
+                            self._ui_call(lambda: self._show_idle_alert(idle_minutes))
         
         self.idle_counter_thread = threading.Thread(target=thread, daemon=True)
         self.idle_counter_thread.start()
@@ -650,9 +665,27 @@ class SleepPauseApp:
             except Exception:
                 pass
             self.idle_alert_window = None
+        # Убираем уведомление в трее, если показывали его
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.remove_notification()
+        except Exception:
+            pass
 
     def _show_idle_alert(self, idle_minutes):
         """Показывает предупреждение за 5 минут до срабатывания бездействия."""
+        # Если окно спрятано в трей — предупреждаем уведомлением от значка в трее
+        if self._is_window_hidden() and self.tray_icon is not None:
+            self.idle_alert_window = True  # маркер «предупреждение активно»
+            try:
+                self.tray_icon.notify(
+                    f"Через 5 минут будет выполнено действие:\n{self.key_var.get()}\n\n"
+                    "Подвигайте мышь, чтобы отменить.",
+                    "⏳ Sleep Pause Timer",
+                )
+            except Exception as e:
+                print(f"DEBUG: tray notify error: {e}")
+            return
         try:
             # Звуковой сигнал
             try:
@@ -723,10 +756,18 @@ class SleepPauseApp:
         except Exception as e:
             print(f"DEBUG: idle alert error: {e}")
 
-    def _cancel_idle_alert(self, alert):
+    def _cancel_idle_alert(self, alert=None):
         """Отменяет предупреждение при активности."""
-        if self.idle_alert_window is not None:
-            self.idle_alert_window = None
+        if self.idle_alert_window is None:
+            return
+        self.idle_alert_window = None
+        # Убираем уведомление в трее, если показывали его
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.remove_notification()
+        except Exception:
+            pass
+        if alert is not None:
             try:
                 alert.destroy()
             except Exception:
@@ -1390,6 +1431,44 @@ class SleepPauseApp:
             print("DEBUG: activation diagnostics:\n", info)
 
     # ---------- Tray helpers (с цветовым индикатором) ----------
+    def _is_tracking_active(self):
+        """True, если работает основной таймер или отслеживание бездействия."""
+        try:
+            if self.worker is not None and self.worker.is_alive():
+                return True
+        except Exception:
+            pass
+        try:
+            if self.idle_counter_thread is not None and self.idle_counter_thread.is_alive():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _is_window_hidden(self):
+        """True, если главное окно спрятано (свернуто в трей)."""
+        try:
+            return self.root.state() == "withdrawn"
+        except Exception:
+            return False
+
+    def _on_root_unmap(self, event):
+        """Сворачивание окна (кнопка «–») при активном таймере/отслеживании — в трей."""
+        if event.widget is not self.root:
+            return
+        # state() обновляется не мгновенно — проверяем отложенно
+        try:
+            self.root.after(200, self._minimize_to_tray_if_iconic)
+        except Exception:
+            pass
+
+    def _minimize_to_tray_if_iconic(self):
+        try:
+            if self.root.state() == "iconic" and self._is_tracking_active():
+                self.minimize_to_tray()
+        except Exception:
+            pass
+
     def _make_image(self, text):
         if Image is None or ImageDraw is None:
             return None
@@ -1432,13 +1511,20 @@ class SleepPauseApp:
     def _update_tray(self):
         if self.tray_icon is None:
             return
-        hours = self.current_remaining // 3600
-        mins = (self.current_remaining % 3600) // 60
-        secs = self.current_remaining % 60
-        tooltip = f"Осталось {hours:02d}:{mins:02d}:{secs:02d}"
+        idle_alive = (self.idle_counter_thread is not None
+                      and self.idle_counter_thread.is_alive())
+        if self.current_remaining > 0:
+            hours = self.current_remaining // 3600
+            mins = (self.current_remaining % 3600) // 60
+            secs = self.current_remaining % 60
+            tooltip = f"Осталось {hours:02d}:{mins:02d}:{secs:02d}"
+        elif idle_alive:
+            tooltip = "⏳ Отслеживание бездействия..."
+        else:
+            tooltip = "Sleep Pause Timer"
         try:
             self.tray_icon.title = tooltip
-            running = (self.worker is not None and self.worker.is_alive() and self.current_remaining > 0)
+            running = idle_alive or (self.worker is not None and self.worker.is_alive() and self.current_remaining > 0)
             indicator = None
             if not running:
                 indicator = (200, 0, 0)  # красный — таймер не активен
@@ -1467,7 +1553,7 @@ class SleepPauseApp:
             try:
                 self.tray_icon = pystray.Icon("sleep_pause")
                 self.tray_icon.menu = pystray.Menu(
-                    pystray.MenuItem("Restore", lambda _: self._on_restore()),
+                    pystray.MenuItem("Restore", lambda _: self._on_restore(), default=True),
                     pystray.MenuItem("Exit", lambda _: self._on_exit())
                 )
                 try:
@@ -1475,7 +1561,7 @@ class SleepPauseApp:
                         default_img = ImageOps.contain(self.app_icon_img.copy(), (64, 64))
                     else:
                         default_img = self._make_image("0")
-                    running = (self.worker is not None and self.worker.is_alive() and self.current_remaining > 0)
+                    running = self._is_tracking_active()
                     indicator = None if running else (200,0,0)
                     composed = self._compose_tray_icon_with_indicator(default_img, indicator_color=indicator)
                     if composed is not None:
@@ -1483,7 +1569,6 @@ class SleepPauseApp:
                         self.tray_icon.icon = self._icon_image
                 except Exception as e:
                     print("DEBUG: failed to create default tray image:", e)
-                self.current_remaining = 0
                 try:
                     self._update_tray()
                 except Exception:
@@ -1531,7 +1616,8 @@ class SleepPauseApp:
 
     # ---------- Close behavior ----------
     def on_close(self):
-        if self.worker and self.worker.is_alive():
+        # В трей уходим, если работает основной таймер ИЛИ отслеживание бездействия
+        if self._is_tracking_active():
             self.minimize_to_tray()
         else:
             try:
