@@ -57,3 +57,9 @@ pyinstaller sleep_pause.spec --noconfirm
 ## Лицензия
 
 [MIT](LICENSE) © Voltur
+
+## Поддержать автора
+
+Если программа оказалась полезной, можно поддержать разработку:
+
+**[boosty.to/voltur/donate](https://boosty.to/voltur/donate)**
