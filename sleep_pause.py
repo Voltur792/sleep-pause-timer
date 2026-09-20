@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+import json
+import logging
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from datetime import datetime, timedelta
+from pathlib import Path
+from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 # Опциональные зависимости
@@ -51,6 +57,11 @@ DEFAULT_SEC = "0"
 KEY_OPTIONS = ["playpause", "shutdown", "sleep"]
 APP_ICON_PNG = "app_icon.png"
 APP_ICON_ICO = "app_icon.ico"
+
+# Будильник: каталог состояния (отдельный от плагина Astra) и дефолтная
+# мелодия (системный звук Windows, если пользователь не выбрал свою).
+ALARM_STATE_DIR_ENV = "SPT_APP_ALARM_STATE_DIR"
+DEFAULT_ALARM_SOUND = r"C:\Windows\Media\Alarm01.wav"
 
 # ----------------- Theme helpers -----------------
 def apply_dark_theme(style: ttk.Style):
@@ -156,6 +167,459 @@ def load_app_icon():
         return None
     return None
 
+# ----------------- Alarm engine (порт из плагина sleep-pause-timer) -----------------
+class AlarmError(ValueError):
+    pass
+
+
+def default_alarm_state_path():
+    base = os.environ.get(ALARM_STATE_DIR_ENV)
+    if not base:
+        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "SleepPauseTimer" / "alarm.json"
+
+
+class AlarmStore:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def save(self, payload):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+
+
+def normalize_sound_path(path):
+    raw = str(path or "").strip()
+    if not raw:
+        raise AlarmError("Укажите путь к аудиофайлу")
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    candidate = Path(expanded)
+    if not candidate.is_file():
+        raise AlarmError(f"Аудиофайл не найден: {expanded}")
+    return str(candidate)
+
+
+class WmpPlayer:
+    """Windows Media Player (legacy wmplayer.exe) через subprocess — надежно играет MP3, WAV, WMA, M4A на Windows."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._process = None
+        self._wmp_path = self._find_wmplayer()
+
+    def _find_wmplayer(self):
+        """Найти путь к wmplayer.exe в стандартных местах Windows."""
+        candidates = [
+            r"C:\Program Files (x86)\Windows Media Player\wmplayer.exe",
+            r"C:\Program Files\Windows Media Player\wmplayer.exe",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        # Фоллбэк — полагаемся на PATH (редко работает)
+        return "wmplayer.exe"
+
+    def play_once(self, path, should_continue=None):
+        log = logging.getLogger("alarm")
+
+        if '"' in path:
+            raise AlarmError("Путь к аудиофайлу не должен содержать кавычки")
+
+        if not Path(path).exists():
+            raise AlarmError(f"Аудиофайл не найден: {path}")
+
+        self._stop_event.clear()
+
+        try:
+            # wmplayer.exe (legacy Windows Media Player) с флагами /play /close:
+            # /play — начать воспроизведение сразу, /close — закрыть после завершения.
+            cmd = [self._wmp_path, "/play", "/close", path]
+
+            log.info("Starting wmplayer.exe: %s", " ".join(cmd))
+
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NO_WINDOW
+
+            proc = subprocess.Popen(
+                cmd,
+                creationflags=creation_flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            self._process = proc
+            log.info("Started wmplayer.exe PID=%d for: %s", proc.pid, path)
+
+            # Ждём завершения процесса или стоп-события
+            while not self._stop_event.wait(0.2):
+                if should_continue is not None:
+                    try:
+                        allowed = should_continue()
+                    except Exception:
+                        allowed = False
+                    if not allowed:
+                        break
+                # Проверяем, не завершился ли процесс сам
+                ret = proc.poll()
+                if ret is not None:
+                    log.info("WMP process exited with code %d", ret)
+                    break
+
+            return True
+        finally:
+            self.stop()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._process:
+            try:
+                if self._process.poll() is None:
+                    self._process.terminate()
+                    self._process.wait(timeout=2)
+            except Exception:
+                pass
+            self._process = None
+
+
+class AlarmEngine:
+    def __init__(self, state_path=None, now_fn=None, player=None):
+        self._store = AlarmStore(state_path or default_alarm_state_path())
+        self._player = player or WmpPlayer()
+        self._now = now_fn or datetime.now
+        self._condition = threading.Condition(threading.RLock())
+        self._generation = 0
+        self._thread = None
+        self._scheduled = False
+        self._playing = False
+        self._hour = 0
+        self._minute = 0
+        self._repeat = True
+        self._interval = 5
+        self._sound_path = ""
+        self._next_trigger = None
+        self._outcome = ""
+        self._info = ""
+        self._storage_error = ""
+        with self._condition:
+            self._restore_locked()
+
+    def _restore_locked(self):
+        data = self._store.load()
+        sound_path = str(data.get("sound_path", "") or "")
+        self._sound_path = sound_path
+        alarm = data.get("alarm")
+        if not isinstance(alarm, dict):
+            return
+        try:
+            hour = int(alarm["hour"])
+            minute = int(alarm["minute"])
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                raise ValueError
+            repeat = bool(alarm.get("repeat", True))
+            interval = int(alarm.get("interval", 5))
+            if interval < 1:
+                interval = 5
+        except (KeyError, TypeError, ValueError):
+            return
+        self._scheduled = True
+        self._hour = hour
+        self._minute = minute
+        self._repeat = repeat
+        self._interval = interval
+        self._next_trigger = self._next_occurrence(hour, minute)
+        self._info = "будильник восстановлен"
+        self._start_thread_locked()
+
+    def _next_occurrence(self, hour, minute, after=None):
+        """Ближайшее HH:MM строго после `after` (по умолчанию — после «сейчас»).
+
+        Интервал повтора здесь ни при чём: он задаёт паузу между звонками уже
+        зазвонившего будильника (см. _run), а не шаг расписания.
+        """
+        base = after if after is not None else self._now()
+        candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= base:
+            candidate += timedelta(days=1)
+        return candidate
+
+    def _payload_locked(self):
+        if not self._scheduled:
+            return {"sound_path": self._sound_path}
+        return {
+            "sound_path": self._sound_path,
+            "alarm": {
+                "hour": self._hour,
+                "minute": self._minute,
+                "repeat": self._repeat,
+                "interval": self._interval,
+            },
+        }
+
+    def _save_locked(self):
+        try:
+            self._store.save(self._payload_locked())
+            self._storage_error = ""
+        except OSError as exc:
+            self._storage_error = str(exc)
+
+    def _start_thread_locked(self):
+        self._generation += 1
+        thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = thread
+        thread.start()
+
+    def set_alarm(self, hour, minute, sound_path, repeat=True, interval=5):
+        normalized_path = normalize_sound_path(sound_path)
+        hour = int(hour)
+        minute = int(minute)
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise AlarmError("Время будильника должно быть в диапазоне 00:00–23:59")
+        interval = max(1, int(interval))
+        with self._condition:
+            self._generation += 1
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._scheduled = True
+            self._playing = False
+            self._hour = hour
+            self._minute = minute
+            self._repeat = bool(repeat)
+            self._interval = interval
+            self._sound_path = normalized_path
+            self._next_trigger = self._next_occurrence(hour, minute)
+            self._outcome = ""
+            self._info = "будильник установлен"
+            self._storage_error = ""
+            self._save_locked()
+            self._start_thread_locked()
+            return self._state_locked()
+
+    def set_sound(self, sound_path):
+        normalized_path = normalize_sound_path(sound_path)
+        with self._condition:
+            self._sound_path = normalized_path
+            self._storage_error = ""
+            self._save_locked()
+            return self._state_locked()
+
+    def cancel(self):
+        with self._condition:
+            was_active = self._scheduled or self._playing
+            self._generation += 1
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._scheduled = False
+            self._playing = False
+            self._next_trigger = None
+            self._outcome = "cancelled" if was_active else ""
+            self._info = "будильник отменён" if was_active else "будильник не установлен"
+            self._storage_error = ""
+            self._save_locked()
+            self._condition.notify_all()
+            return self._state_locked()
+
+    def stop_playback(self):
+        """Глушит текущий звонок, не отменяя расписание.
+
+        Повторяющийся будильник остаётся и звонит завтра в то же время,
+        одиночный после состоявшегося звонка больше не активен.
+        """
+        with self._condition:
+            was_playing = self._playing
+            self._generation += 1
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._playing = False
+            self._outcome = "stopped" if was_playing else ""
+            rescheduled = False
+            if was_playing and self._scheduled:
+                if self._repeat:
+                    self._next_trigger = self._next_occurrence(
+                        self._hour,
+                        self._minute,
+                        after=self._now(),
+                    )
+                    rescheduled = True
+                    self._info = "воспроизведение остановлено; следующий звонок завтра"
+                else:
+                    self._scheduled = False
+                    self._next_trigger = None
+                    self._info = "воспроизведение остановлено"
+            else:
+                self._info = "воспроизведение остановлено" if was_playing else "будильник не играл"
+            self._storage_error = ""
+            self._save_locked()
+            self._condition.notify_all()
+            if rescheduled:
+                self._start_thread_locked()
+            return self._state_locked()
+
+    def _playback_allowed(self, generation):
+        with self._condition:
+            return (
+                generation == self._generation
+                and self._scheduled
+                and self._playing
+            )
+
+    def _run(self):
+        log = logging.getLogger("alarm")
+        with self._condition:
+            generation = self._generation
+        log.info("Alarm thread started, generation=%d", generation)
+        while True:
+            with self._condition:
+                if generation != self._generation or not self._scheduled:
+                    log.info("Alarm thread exiting: generation mismatch or not scheduled")
+                    return
+                if self._playing:
+                    self._condition.wait()
+                    continue
+                now = self._now()
+                trigger = self._next_trigger
+                if trigger is None:
+                    self._scheduled = False
+                    log.warning("Alarm trigger is None, stopping thread")
+                    return
+                delay = (trigger - now).total_seconds()
+                if delay > 0:
+                    log.debug("Alarm waiting %.1f seconds until %s", delay, trigger)
+                    self._condition.wait(timeout=delay)
+                    continue
+                self._playing = True
+                self._outcome = "fired"
+                self._info = "будильник сработал"
+                hour = self._hour
+                minute = self._minute
+                repeat = self._repeat
+                interval = self._interval
+                sound_path = self._sound_path
+                log.info("Alarm firing at %s, sound=%s", now.strftime("%H:%M:%S"), sound_path)
+            try:
+                while self._playback_allowed(generation):
+                    self._player.play_once(
+                        sound_path,
+                        lambda: self._playback_allowed(generation),
+                    )
+                    if not repeat or not self._playback_allowed(generation):
+                        break
+                    with self._condition:
+                        self._condition.wait(timeout=interval * 60)
+            except Exception as exc:
+                with self._condition:
+                    if generation != self._generation:
+                        return
+                    self._playing = False
+                    self._scheduled = False
+                    self._next_trigger = None
+                    self._outcome = "error"
+                    self._info = f"ошибка воспроизведения: {exc}"
+                    self._storage_error = ""
+                    self._save_locked()
+                    log.error("Alarm playback error: %s", exc)
+                return
+
+            with self._condition:
+                if generation != self._generation:
+                    return
+                self._playing = False
+                if repeat:
+                    self._next_trigger = self._next_occurrence(
+                        hour,
+                        minute,
+                        after=self._now(),
+                    )
+                    self._info = "будильник сработал; следующий запуск подготовлен"
+                else:
+                    self._scheduled = False
+                    self._next_trigger = None
+                    self._info = "будильник сработал"
+                self._outcome = "fired"
+                self._storage_error = ""
+                self._save_locked()
+                log.info("Alarm finished, scheduled=%s, next_trigger=%s", self._scheduled, self._next_trigger)
+                if not self._scheduled:
+                    return
+
+    def _state_locked(self):
+        now = self._now()
+        trigger = self._next_trigger
+        if self._scheduled and trigger is None:
+            trigger = self._next_occurrence(self._hour, self._minute)
+            self._next_trigger = trigger
+        remaining = 0
+        if trigger is not None:
+            remaining = max(0, int((trigger - now).total_seconds()))
+        if self._sound_path:
+            try:
+                sound_name = Path(self._sound_path).name
+            except (OSError, ValueError):
+                sound_name = self._sound_path
+        else:
+            sound_name = ""
+        if self._playing:
+            status = "playing"
+        elif self._scheduled:
+            status = "scheduled"
+        else:
+            status = "idle"
+        return {
+            "scheduled": self._scheduled,
+            "playing": self._playing,
+            "status": status,
+            "hour": self._hour if self._scheduled else 0,
+            "minute": self._minute if self._scheduled else 0,
+            "repeat": self._repeat,
+            "interval": self._interval,
+            "sound_path": self._sound_path,
+            "sound_name": sound_name,
+            "next_time": trigger.strftime("%H:%M") if trigger else "",
+            "next_datetime": trigger.isoformat(timespec="seconds") if trigger else "",
+            "remaining_seconds": remaining,
+            "outcome": self._outcome,
+            "info": self._info,
+            "storage_error": self._storage_error,
+        }
+
+    def state(self):
+        with self._condition:
+            return self._state_locked()
+
+    def stop_thread(self):
+        with self._condition:
+            self._generation += 1
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._playing = False
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
+
+
 # ----------------- Main app -----------------
 class SleepPauseApp:
     def __init__(self, root):
@@ -187,6 +651,12 @@ class SleepPauseApp:
         self.idle_counter_thread = None
         self.idle_alert_window = None
         self.idle_action_executed = False  # Флаг: действие уже выполнено
+
+        # Будильник: движок восстанавливает сохранённое расписание сам
+        self.alarm = AlarmEngine()
+        self._alarm_notified = False
+        self._alarm_last_signature = None
+        self._alarm_after_id = None
 
         # Load icon - используем большой размер для панели задач (512 для высокого DPI)
         self.app_icon_img = load_app_icon()
@@ -319,6 +789,77 @@ class SleepPauseApp:
                                     fg=self.label_fg, font=("Segoe UI", 9))
         self.idle_label.pack(side="left", padx=(4, 0))
 
+        # --- Будильник ---
+        tk.Label(self.settings_card, text="⏰ Будильник", bg=self.frame_bg,
+                 fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w", pady=(10, 0))
+
+        alarm_time_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
+        alarm_time_frame.pack(fill="x", pady=(5, 0))
+
+        self.alarm_hour_entry = tk.Entry(alarm_time_frame, width=3, font=("Segoe UI", 11, "bold"),
+                                          bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
+                                          insertbackground=self.accent, relief="flat")
+        self.alarm_hour_entry.insert(0, "07")
+        self.alarm_hour_entry.pack(side="left")
+
+        tk.Label(alarm_time_frame, text=":", bg=self.frame_bg, fg=self.label_fg,
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+
+        self.alarm_minute_entry = tk.Entry(alarm_time_frame, width=3, font=("Segoe UI", 11, "bold"),
+                                            bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
+                                            insertbackground=self.accent, relief="flat")
+        self.alarm_minute_entry.insert(0, "30")
+        self.alarm_minute_entry.pack(side="left", padx=(0, 10))
+
+        self.alarm_repeat_var = tk.BooleanVar(value=True)
+        self.alarm_repeat_check = tk.Checkbutton(
+            alarm_time_frame, text="Ежедневно", variable=self.alarm_repeat_var,
+            bg=self.frame_bg, fg=self.label_fg, font=("Segoe UI", 9),
+            activebackground=self.frame_bg, activeforeground=self.label_fg,
+            selectcolor=self.entry_bg, bd=0, takefocus=0, relief="flat",
+            highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
+        self.alarm_repeat_check.pack(side="left", padx=(0, 10))
+
+        tk.Label(alarm_time_frame, text="Интервал", bg=self.frame_bg,
+                 fg=self.label_fg, font=("Segoe UI", 9)).pack(side="left")
+        self.alarm_interval_spin = tk.Spinbox(alarm_time_frame, from_=1, to=60, width=3,
+                                               font=("Segoe UI", 10, "bold"), justify="center",
+                                               bg=self.entry_bg, fg=self.input_fg, bd=0,
+                                               relief="flat", takefocus=0)
+        self.alarm_interval_spin.delete(0, "end")
+        self.alarm_interval_spin.insert(0, "5")
+        self.alarm_interval_spin.pack(side="left", padx=(4, 0))
+        tk.Label(alarm_time_frame, text="мин", bg=self.frame_bg,
+                 fg=self.label_fg, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
+
+        # Мелодия будильника
+        alarm_sound_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
+        alarm_sound_frame.pack(fill="x", pady=(5, 0))
+
+        self.alarm_sound_entry = tk.Entry(alarm_sound_frame, font=("Segoe UI", 9),
+                                           bg=self.entry_bg, fg=self.input_fg, bd=0, relief="flat")
+        self.alarm_sound_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 6))
+
+        self.btn_alarm_sound = tk.Button(alarm_sound_frame, text="🎵 Мелодия", command=self._alarm_pick_sound,
+                                          font=("Segoe UI", 9, "bold"), bd=0, padx=10, pady=4,
+                                          cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
+                                          highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
+        self.btn_alarm_sound.pack(side="left")
+
+        # Кнопка будильника + статус
+        alarm_ctl_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
+        alarm_ctl_frame.pack(fill="x", pady=(5, 0))
+
+        self.btn_alarm = tk.Button(alarm_ctl_frame, text="⏰ Установить", command=self._alarm_button_click,
+                                    font=("Segoe UI", 10, "bold"), bd=0, padx=12, pady=5,
+                                    cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
+                                    highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
+        self.btn_alarm.pack(side="left")
+
+        self.alarm_status = tk.Label(alarm_ctl_frame, text="Будильник не установлен", bg=self.frame_bg,
+                                      fg=self.label_fg, font=("Segoe UI", 9))
+        self.alarm_status.pack(side="left", padx=(8, 0), fill="x", expand=True)
+
         # Кнопки
         self.btn_frame = tk.Frame(frm, bg=self.main_bg)
         self.btn_frame.pack(fill="x", pady=(0, 10))
@@ -373,6 +914,8 @@ class SleepPauseApp:
             self.btn_theme: "neutral",
             self.btn_idle: "warning",
             self.btn_cancel_idle: "error",
+            self.btn_alarm: "accent",
+            self.btn_alarm_sound: "neutral",
         }
         self._apply_button_palette()
         self._bind_button_animations()
@@ -401,6 +944,9 @@ class SleepPauseApp:
         root.bind("<Motion>", self._reset_idle_counter)
         root.bind("<Key>", self._reset_idle_counter)
         root.bind("<Button>", self._reset_idle_counter)
+
+        # Поллер будильника: статус, кнопка, трей, уведомление о звонке
+        self._alarm_tick(force=True)
 
     # ---------- UI helpers ----------
     def _hex_to_rgb(self, value):
@@ -915,7 +1461,8 @@ class SleepPauseApp:
                 except Exception:
                     pass
 
-        for entry in (self.entry_hour, self.entry_min, self.entry_sec, self.win_title_entry):
+        for entry in (self.entry_hour, self.entry_min, self.entry_sec, self.win_title_entry,
+                      self.alarm_hour_entry, self.alarm_minute_entry, self.alarm_sound_entry):
             try:
                 entry.configure(
                     bg=self.entry_bg,
@@ -927,6 +1474,23 @@ class SleepPauseApp:
                 )
             except Exception:
                 pass
+
+        # Спинбоксы и чекбокс будильника под тему
+        for spin in (self.idle_spin, self.alarm_interval_spin):
+            try:
+                spin.configure(bg=self.entry_bg, fg=self.input_fg, buttonbackground=self.entry_bg,
+                               insertbackground=self.accent, highlightthickness=1,
+                               highlightbackground=self.card_border, highlightcolor=self.accent)
+            except Exception:
+                pass
+        try:
+            self.alarm_repeat_check.configure(
+                bg=self.frame_bg, fg=self.label_fg,
+                activebackground=self.frame_bg, activeforeground=self.label_fg,
+                selectcolor=self.entry_bg,
+                highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
+        except Exception:
+            pass
 
         self._apply_button_palette()
         self._set_button_state(self.btn_start, enabled=str(self.btn_start.cget("state")) != "disabled")
@@ -943,6 +1507,9 @@ class SleepPauseApp:
             self._set_status(current_text, self.error, pulse=False)
         else:
             self._set_status(current_text, self.success, pulse=False)
+
+        # Статус будильника перекрашивается по своему состоянию (после общих Label)
+        self._alarm_tick(force=True)
 
     # ---------- Start / Cancel / Pause ----------
     def start(self):
@@ -1058,6 +1625,147 @@ class SleepPauseApp:
             self._apply_button_palette()
             self.btn_pause.config(text="⏸ Пауза")
             self._set_button_state(self.btn_pause, enabled=True)
+
+    # ---------- Alarm ----------
+    def _alarm_pick_sound(self):
+        """Выбор мелодии будильника через диалог."""
+        path = filedialog.askopenfilename(
+            title="Мелодия будильника",
+            filetypes=[
+                ("Аудиофайлы", "*.mp3;*.wav;*.wma;*.m4a;*.aac;*.flac;*.ogg;*.mid;*.midi"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if path:
+            self.alarm_sound_entry.delete(0, "end")
+            self.alarm_sound_entry.insert(0, path)
+
+    def _alarm_resolve_sound(self):
+        """Мелодия: поле → сохранённая → системная Windows → пусто (ошибка)."""
+        path = self.alarm_sound_entry.get().strip()
+        if not path:
+            try:
+                path = str(self.alarm.state().get("sound_path", "") or "")
+            except Exception:
+                path = ""
+        if not path and os.path.isfile(DEFAULT_ALARM_SOUND):
+            path = DEFAULT_ALARM_SOUND
+        return path
+
+    def _alarm_button_click(self):
+        st = self.alarm.state()
+        if st.get("playing"):
+            self.alarm.stop_playback()
+            self._alarm_notified = False
+            self._alarm_clear_tray_notification()
+        elif st.get("scheduled"):
+            self.alarm.cancel()
+        else:
+            self._alarm_apply()
+        self._alarm_tick(force=True)
+
+    def _alarm_apply(self):
+        """Установить будильник по полям формы."""
+        try:
+            hour = int(self.alarm_hour_entry.get())
+            minute = int(self.alarm_minute_entry.get())
+        except ValueError:
+            messagebox.showerror("Ошибка", "Введите время будильника числами (ЧЧ и ММ)")
+            return
+        try:
+            interval = max(1, int(self.alarm_interval_spin.get()))
+        except ValueError:
+            messagebox.showerror("Ошибка", "Интервал повтора — целое число минут")
+            return
+        sound = self._alarm_resolve_sound()
+        if not sound:
+            messagebox.showerror("Ошибка", "Выберите мелодию будильника (кнопка «🎵 Мелодия»)")
+            return
+        try:
+            self.alarm.set_alarm(hour, minute, sound,
+                                 repeat=self.alarm_repeat_var.get(), interval=interval)
+        except AlarmError as exc:
+            messagebox.showerror("Ошибка", str(exc))
+            return
+        # Показываем выбранную мелодию в поле (могла прийти из сохранённой/системной)
+        try:
+            st = self.alarm.state()
+            self.alarm_sound_entry.delete(0, "end")
+            self.alarm_sound_entry.insert(0, st.get("sound_path", ""))
+        except Exception:
+            pass
+
+    def _alarm_clear_tray_notification(self):
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.remove_notification()
+        except Exception:
+            pass
+
+    def _alarm_tick(self, force=False):
+        """Раз в секунду: статус будильника, кнопка, трей и уведомление о звонке."""
+        try:
+            st = self.alarm.state()
+        except Exception:
+            st = {}
+        signature = (st.get("status"), st.get("next_time"), st.get("outcome"), st.get("info"))
+        if force or signature != self._alarm_last_signature:
+            self._alarm_last_signature = signature
+            status = st.get("status")
+            if status == "playing":
+                text = f"🔔 Звонит! {st.get('sound_name', '')}".strip()
+                color = self.error
+                self.btn_alarm.config(text="⏹ Стоп звонка")
+                self.button_roles[self.btn_alarm] = "error"
+            elif status == "scheduled":
+                when = st.get("next_time", "")
+                mode = "ежедневно" if st.get("repeat") else "один раз"
+                text = f"⏰ Будильник на {when} ({mode})"
+                if st.get("interval", 5) > 1:
+                    text += f" · повтор каждые {st['interval']} мин"
+                color = self.accent
+                self.btn_alarm.config(text="⏹ Отменить")
+                self.button_roles[self.btn_alarm] = "error"
+            else:
+                text = st.get("info", "") if st.get("outcome") == "error" else "Будильник не установлен"
+                color = self.error if st.get("outcome") == "error" else self.label_fg
+                self.btn_alarm.config(text="⏰ Установить")
+                self.button_roles[self.btn_alarm] = "accent"
+            try:
+                self.alarm_status.config(text=text, fg=color)
+                self._apply_button_palette()
+                self._set_button_state(self.btn_alarm, enabled=True)
+            except Exception:
+                pass
+            # Уведомление из трея, когда звонок начался, а окно спрятано
+            if status == "playing" and not self._alarm_notified:
+                self._alarm_notified = True
+                if self._is_window_hidden() and self.tray_icon is not None:
+                    try:
+                        self.tray_icon.notify(
+                            f"Будильник звонит: {st.get('sound_name', '')}\n"
+                            "Откройте приложение, чтобы остановить.",
+                            "⏰ Sleep Pause Timer",
+                        )
+                    except Exception as e:
+                        print(f"DEBUG: alarm tray notify error: {e}")
+            if status != "playing" and self._alarm_notified:
+                self._alarm_notified = False
+                self._alarm_clear_tray_notification()
+            try:
+                self._update_tray()
+            except Exception:
+                pass
+        # Ровно один запланированный тик (update_ui_colors зовёт принудительный)
+        if self._alarm_after_id is not None:
+            try:
+                self.root.after_cancel(self._alarm_after_id)
+            except Exception:
+                pass
+        try:
+            self._alarm_after_id = self.root.after(1000, self._alarm_tick)
+        except Exception:
+            self._alarm_after_id = None
 
     # ---------- Window activation (improved, supports numbered selection) ----------
     def _resolve_target_title(self, entry_text: str):
@@ -1443,6 +2151,13 @@ class SleepPauseApp:
                 return True
         except Exception:
             pass
+        # Будильник: запланирован или звонит — приложение должно остаться жить в трее
+        try:
+            alarm_st = self.alarm.state()
+            if alarm_st.get("scheduled") or alarm_st.get("playing"):
+                return True
+        except Exception:
+            pass
         return False
 
     def _is_window_hidden(self):
@@ -1513,6 +2228,11 @@ class SleepPauseApp:
             return
         idle_alive = (self.idle_counter_thread is not None
                       and self.idle_counter_thread.is_alive())
+        try:
+            alarm_st = self.alarm.state()
+        except Exception:
+            alarm_st = {}
+        alarm_active = bool(alarm_st.get("scheduled") or alarm_st.get("playing"))
         if self.current_remaining > 0:
             hours = self.current_remaining // 3600
             mins = (self.current_remaining % 3600) // 60
@@ -1520,19 +2240,30 @@ class SleepPauseApp:
             tooltip = f"Осталось {hours:02d}:{mins:02d}:{secs:02d}"
         elif idle_alive:
             tooltip = "⏳ Отслеживание бездействия..."
+        elif alarm_st.get("playing"):
+            tooltip = "⏰ Будильник звонит!"
         else:
             tooltip = "Sleep Pause Timer"
+        # Будильник добавляется к тултипу
+        if alarm_active and not alarm_st.get("playing"):
+            when = alarm_st.get("next_time", "")
+            if when:
+                tooltip = f"{tooltip} · ⏰ {when}"
         try:
             self.tray_icon.title = tooltip
-            running = idle_alive or (self.worker is not None and self.worker.is_alive() and self.current_remaining > 0)
+            running = (idle_alive
+                       or alarm_active
+                       or (self.worker is not None and self.worker.is_alive() and self.current_remaining > 0))
             indicator = None
             if not running:
                 indicator = (200, 0, 0)  # красный — таймер не активен
-            elif self.paused:
+            elif self.paused and self.current_remaining > 0:
                 indicator = (0, 180, 0)  # зелёный — пауза
             if self.app_icon_img is not None and Image is not None:
                 base = self.app_icon_img.copy()
             else:
+                mins = self.current_remaining // 60
+                secs = self.current_remaining % 60
                 base = self._make_image(f"{mins}" if self.current_remaining >= 60 else f"{secs}")
             img = self._compose_tray_icon_with_indicator(base, indicator_color=indicator)
             if img is not None:
@@ -1604,6 +2335,13 @@ class SleepPauseApp:
 
     def _on_exit(self):
         self.stop_event.set()
+        # Будильник: глушим звонок и поток (расписание остаётся в alarm.json
+        # и восстановится при следующем запуске)
+        try:
+            self.alarm.stop_thread()
+        except Exception:
+            pass
+        self._alarm_clear_tray_notification()
         try:
             if self.tray_icon:
                 self.tray_icon.stop()
