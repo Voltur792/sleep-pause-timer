@@ -63,6 +63,12 @@ APP_ICON_ICO = "app_icon.ico"
 ALARM_STATE_DIR_ENV = "SPT_APP_ALARM_STATE_DIR"
 DEFAULT_ALARM_SOUND = r"C:\Windows\Media\Alarm01.wav"
 
+
+def _idle_elapsed_ms(current_ticks, last_input_ticks):
+    """Unsigned 32-bit tick delta used by LASTINPUTINFO.dwTime."""
+    return (int(current_ticks) - int(last_input_ticks)) & 0xFFFFFFFF
+
+
 # ----------------- Theme helpers -----------------
 def apply_dark_theme(style: ttk.Style):
     bg = "#0b1220"
@@ -312,7 +318,7 @@ class AlarmEngine:
         self._interval = 5
         self._days_of_week = [0, 1, 2, 3, 4, 5, 6]  # 0=Mon, 6=Sun
         self._sound_path = ""
-        self._monthly_alarms = {}  # date_str (YYYY-MM-DD) -> {"hour": h, "minute": m}
+        self._monthly_alarms = {}  # date_str -> list of {"hour": h, "minute": m}
         self._next_weekly_trigger = None
         self._next_trigger = None
         self._next_trigger_type = None
@@ -329,23 +335,32 @@ class AlarmEngine:
         self._sound_path = str(data.get("sound_path", "") or "")
 
         monthly = data.get("monthly_alarms")
+        restored_monthly = {}
         if isinstance(monthly, dict):
-            restored_monthly = {}
-            for date_str, alarm in monthly.items():
-                if not isinstance(alarm, dict):
-                    continue
+            for date_str, stored in monthly.items():
                 try:
-                    hour = int(alarm["hour"])
-                    minute = int(alarm["minute"])
-                    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-                        continue
-                    datetime.strptime(str(date_str), "%Y-%m-%d")
-                    restored_monthly[str(date_str)] = {"hour": hour, "minute": minute}
+                    date_str = str(date_str)
+                    datetime.strptime(date_str, "%Y-%m-%d")
+                    # Earlier versions stored one object per date. Accept both
+                    # that format and the new list of times without data loss.
+                    candidates = stored if isinstance(stored, list) else [stored]
+                    alarms = []
+                    seen = set()
+                    for alarm in candidates:
+                        if not isinstance(alarm, dict):
+                            continue
+                        hour, minute = int(alarm["hour"]), int(alarm["minute"])
+                        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                            continue
+                        key = (hour, minute)
+                        if key not in seen:
+                            alarms.append({"hour": hour, "minute": minute})
+                            seen.add(key)
+                    if alarms:
+                        restored_monthly[date_str] = sorted(alarms, key=lambda item: (item["hour"], item["minute"]))
                 except (KeyError, TypeError, ValueError):
                     continue
-            self._monthly_alarms = restored_monthly
-        else:
-            self._monthly_alarms = {}
+        self._monthly_alarms = restored_monthly
 
         alarm = data.get("alarm")
         if isinstance(alarm, dict):
@@ -363,6 +378,9 @@ class AlarmEngine:
                     days_of_week = [0, 1, 2, 3, 4, 5, 6]
                 elif not isinstance(days_of_week, list) or len(days_of_week) == 0:
                     days_of_week = [0, 1, 2, 3, 4, 5, 6]
+                if any(type(day) is not int or not 0 <= day <= 6 for day in days_of_week):
+                    raise ValueError("invalid days_of_week")
+                days_of_week = sorted(set(days_of_week))
             except (KeyError, TypeError, ValueError):
                 hour = None
             else:
@@ -383,27 +401,43 @@ class AlarmEngine:
         )
         self._start_thread_locked()
 
+    def _claim_monthly_alarm_locked(self, date_str, hour, minute):
+        """Снимает одно сработавшее время и сохраняет остальные на дату."""
+        alarms = self._monthly_alarms.get(date_str, [])
+        alarm_index = next((index for index, item in enumerate(alarms)
+                            if int(item.get("hour", -1)) == int(hour)
+                            and int(item.get("minute", -1)) == int(minute)), None)
+        if alarm_index is None:
+            return False
+        alarms.pop(alarm_index)
+        if alarms:
+            self._monthly_alarms[date_str] = alarms
+        else:
+            self._monthly_alarms.pop(date_str, None)
+        self._save_locked()
+        return True
+
     def _next_monthly_trigger_locked(self, now):
         trigger = None
         trigger_date = None
         expired_dates = []
-        for date_str, alarm in list(self._monthly_alarms.items()):
+        for date_str, alarms in list(self._monthly_alarms.items()):
             try:
                 date_value = datetime.strptime(str(date_str), "%Y-%m-%d")
-                hour = int(alarm["hour"])
-                minute = int(alarm["minute"])
-                if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-                    raise ValueError
-                candidate = datetime(date_value.year, date_value.month, date_value.day, hour, minute)
+                if date_value.date() < now.date():
+                    expired_dates.append(date_str)
+                    continue
+                for alarm in alarms:
+                    hour = int(alarm["hour"])
+                    minute = int(alarm["minute"])
+                    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                        continue
+                    candidate = datetime(date_value.year, date_value.month, date_value.day, hour, minute)
+                    if trigger is None or candidate < trigger:
+                        trigger = candidate
+                        trigger_date = date_str
             except (KeyError, TypeError, ValueError):
                 expired_dates.append(date_str)
-                continue
-            if date_value.date() < now.date():
-                expired_dates.append(date_str)
-                continue
-            if trigger is None or candidate < trigger:
-                trigger = candidate
-                trigger_date = date_str
         for date_str in expired_dates:
             self._monthly_alarms.pop(date_str, None)
         if expired_dates:
@@ -443,8 +477,11 @@ class AlarmEngine:
         
         # Если заданы дни недели, ищем ближайший подходящий день
         if hasattr(self, '_days_of_week') and self._days_of_week:
-            # Если candidate не в списке дней недели, ищем следующий подходящий
-            while candidate.weekday() not in self._days_of_week:
+            # Не доверяем внутреннему состоянию без конца: внешние/старые
+            # сохранённые данные могли содержать неверные дни.
+            for _ in range(7):
+                if candidate.weekday() in self._days_of_week:
+                    break
                 candidate += timedelta(days=1)
         
         return candidate
@@ -489,9 +526,11 @@ class AlarmEngine:
         elif not isinstance(days_of_week, list) or len(days_of_week) == 0:
             days_of_week = [0, 1, 2, 3, 4, 5, 6]
         # Validate days of week (0-6)
-        for d in days_of_week:
-            if not 0 <= d <= 6:
-                raise AlarmError("Дни недели должны быть в диапазоне 0-6 (0=Пн, 6=Вс)")
+        if not isinstance(days_of_week, list) or not days_of_week or any(
+            type(d) is not int or not 0 <= d <= 6 for d in days_of_week
+        ):
+            raise AlarmError("Выберите дни недели из диапазона 0-6 (0=Пн, 6=Вс)")
+        days_of_week = sorted(set(days_of_week))
         with self._condition:
             self._generation += 1
             try:
@@ -631,17 +670,15 @@ class AlarmEngine:
                     interval = self._interval
                     sound_path = self._sound_path
                 else:
-                    monthly_alarm = self._monthly_alarms.pop(trigger_date, None)
-                    if monthly_alarm is None:
+                    if not self._claim_monthly_alarm_locked(trigger_date, trigger.hour, trigger.minute):
                         self._playing = False
                         self._refresh_next_trigger_locked(self._now())
                         continue
-                    hour = monthly_alarm["hour"]
-                    minute = monthly_alarm["minute"]
+                    hour = trigger.hour
+                    minute = trigger.minute
                     repeat = False
                     interval = 5
                     sound_path = self._sound_path
-                    self._save_locked()
 
                 log.info("Alarm firing at %s, sound=%s, type=%s", now.strftime("%H:%M:%S"), sound_path, trigger_type)
 
@@ -696,7 +733,7 @@ class AlarmEngine:
                     "Alarm finished, scheduled=%s, next_trigger=%s, monthly_count=%d",
                     self._scheduled,
                     self._next_trigger,
-                    len(self._monthly_alarms),
+                    sum(len(items) for items in self._monthly_alarms.values()),
                 )
                 if self._next_trigger is None:
                     return
@@ -742,7 +779,7 @@ class AlarmEngine:
             "outcome": self._outcome,
             "info": self._info,
             "storage_error": self._storage_error,
-            "monthly_count": len(self._monthly_alarms),
+            "monthly_count": sum(len(items) for items in self._monthly_alarms.values()),
         }
 
     def state(self):
@@ -750,41 +787,58 @@ class AlarmEngine:
             return self._state_locked()
 
     def get_monthly_alarms(self):
-        """Возвращает копию словаря месячных будильников."""
+        """Возвращает копию расписания: дата -> список времён."""
         with self._condition:
-            return dict(self._monthly_alarms)
+            return {day: [dict(item) for item in alarms]
+                    for day, alarms in self._monthly_alarms.items()}
 
     def set_monthly_alarm(self, date_obj, hour, minute, sound_path=None):
-        """Устанавливает или удаляет будильник на конкретную дату.
-
-        Если hour/minute = None, удаляет будильник на эту дату.
-        """
+        """Добавляет время на дату; пустые hour/minute удаляют все её времена."""
         normalized_path = normalize_sound_path(sound_path) if sound_path else self._sound_path
         date_str = date_obj.isoformat()
         with self._condition:
             if hour is None or minute is None:
-                # Удаляем будильник
                 existed = date_str in self._monthly_alarms
                 if existed:
                     del self._monthly_alarms[date_str]
                     self._save_locked()
-                # Будим поток, чтобы он пересчитал ближайший триггер
                 self._condition.notify_all()
                 return existed
-            else:
-                # Устанавливаем будильник
-                hour = int(hour)
-                minute = int(minute)
-                if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-                    raise AlarmError("Время будильника должно быть в диапазоне 00:00–23:59")
-                self._monthly_alarms[date_str] = {"hour": hour, "minute": minute}
+
+            hour, minute = int(hour), int(minute)
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                raise AlarmError("Время будильника должно быть в диапазоне 00:00–23:59")
+            scheduled_at = datetime.combine(date_obj, datetime.min.time()).replace(hour=hour, minute=minute)
+            if scheduled_at <= self._now():
+                raise AlarmError("Выберите дату и время в будущем")
+            alarms = self._monthly_alarms.setdefault(date_str, [])
+            if any(item["hour"] == hour and item["minute"] == minute for item in alarms):
+                return False
+            alarms.append({"hour": hour, "minute": minute})
+            alarms.sort(key=lambda item: (item["hour"], item["minute"]))
+            self._save_locked()
+            self._start_thread_locked()
+            self._condition.notify_all()
+            return True
+
+    def cancel_monthly_alarm(self, date_obj, hour, minute):
+        """Удаляет только указанное время, сохраняя другие на этой дате."""
+        date_str = date_obj.isoformat()
+        hour, minute = int(hour), int(minute)
+        with self._condition:
+            alarms = self._monthly_alarms.get(date_str, [])
+            remaining = [item for item in alarms
+                         if (item["hour"], item["minute"]) != (hour, minute)]
+            removed = len(remaining) != len(alarms)
+            if removed:
+                if remaining:
+                    self._monthly_alarms[date_str] = remaining
+                else:
+                    self._monthly_alarms.pop(date_str, None)
                 self._save_locked()
-                # Поток мог «уснуть» на старом триггере или уже завершиться —
-                # перезапускаем гарантированно (generation-гейт убьёт старый),
-                # как это делает set_alarm.
                 self._start_thread_locked()
                 self._condition.notify_all()
-                return True
+            return removed
 
     def stop_thread(self):
         with self._condition:
@@ -1368,8 +1422,10 @@ class SleepPauseApp:
                     lli = LASTINPUTINFO()
                     lli.cbSize = ctypes.sizeof(LASTINPUTINFO)
                     user32.GetLastInputInfo(ctypes.byref(lli))
-                    now = kernel32.GetTickCount64()
-                    idle_ms = now - lli.dwTime
+                    # LASTINPUTINFO.dwTime is a 32-bit tick count. Subtracting
+                    # it from GetTickCount64 breaks after Windows uptime wraps.
+                    now = kernel32.GetTickCount()
+                    idle_ms = _idle_elapsed_ms(now, lli.dwTime)
                     idle_secs = idle_ms / 1000.0
                 except Exception:
                     continue
@@ -2000,15 +2056,14 @@ class SleepPauseApp:
         def style_cell(btn, date_str):
             """Перекрашивает существующую кнопку дня (без пересоздания)."""
             day = int(date_str[-2:])
-            alarm = view["alarms"].get(date_str)
+            alarm = bool(view["alarms"].get(date_str))
             is_today = (date_str == now.date().isoformat())
+            text = str(day)
             if alarm:
-                text = f"{day}\n{alarm['hour']:02d}:{alarm['minute']:02d}"
                 bg = self.accent
                 fg = "white"
                 active = self._darken(self.accent, 0.2)
             else:
-                text = str(day)
                 bg = self.accent if is_today else self.entry_bg
                 fg = "white" if is_today else self.input_fg
                 active = self._lighten(bg, 0.2)
@@ -2096,115 +2151,133 @@ class SleepPauseApp:
         build_month()
 
     def _show_time_picker(self, date_obj, date_str, render_callback):
-        """Показывает диалог выбора времени для месячного будильника."""
+        """Показывает расписание выбранной даты и добавляет отдельные времена."""
         time_dlg = tk.Toplevel(self.root)
-        time_dlg.title(f"⏰ Будильник на {date_obj.strftime('%d.%m.%Y')}")
+        time_dlg.title(f"⏰ Будильники на {date_obj.strftime('%d.%m.%Y')}")
         time_dlg.configure(bg=self.frame_bg)
         time_dlg.resizable(False, False)
         time_dlg.transient(self.root)
         time_dlg.grab_set()
 
-        # Время
-        tk.Label(time_dlg, text="Время:", font=("Segoe UI", 10),
-                 bg=self.frame_bg, fg=self.label_fg).pack(anchor="w", padx=15, pady=(15, 5))
-        
+        tk.Label(time_dlg, text="Установленные будильники", font=("Segoe UI", 10, "bold"),
+                 bg=self.frame_bg, fg=self.input_fg).pack(anchor="w", padx=15, pady=(14, 5))
+        alarms_frame = tk.Frame(time_dlg, bg=self.frame_bg)
+        alarms_frame.pack(fill="x", padx=15, pady=(0, 9))
+
+        def render_alarms():
+            for child in alarms_frame.winfo_children():
+                child.destroy()
+            alarms = self.alarm.get_monthly_alarms().get(date_str, [])
+            if not alarms:
+                tk.Label(alarms_frame, text="На эту дату будильников пока нет.",
+                         font=("Segoe UI", 9), bg=self.frame_bg, fg=self.label_fg).pack(anchor="w")
+                return
+            for item in alarms:
+                row = tk.Frame(alarms_frame, bg=self.entry_bg,
+                               highlightthickness=1, highlightbackground=self.card_border)
+                row.pack(fill="x", pady=2)
+                tk.Label(row, text=f"{item['hour']:02d}:{item['minute']:02d}",
+                         font=("Segoe UI", 10, "bold"), bg=self.entry_bg,
+                         fg=self.input_fg).pack(side="left", padx=9, pady=5)
+                def cancel_one(hour=item["hour"], minute=item["minute"]):
+                    if self.alarm.cancel_monthly_alarm(date_obj, hour, minute):
+                        render_alarms()
+                        render_callback()
+                        self._alarm_tick(force=True)
+                tk.Button(row, text="×", command=cancel_one, font=("Segoe UI", 10, "bold"),
+                          bd=0, padx=8, pady=2, cursor="hand2", relief="flat",
+                          bg=self.neutral_btn, fg=self.error,
+                          activebackground=self._darken(self.neutral_btn, 0.15),
+                          activeforeground=self.error, highlightthickness=0).pack(side="right", padx=4, pady=3)
+
+        render_alarms()
+        tk.Label(time_dlg, text="Добавить ещё одно время", font=("Segoe UI", 10, "bold"),
+                 bg=self.frame_bg, fg=self.input_fg).pack(anchor="w", padx=15, pady=(4, 5))
         time_frame = tk.Frame(time_dlg, bg=self.frame_bg)
-        time_frame.pack(padx=15, pady=(0, 10))
-        
+        time_frame.pack(anchor="w", padx=15, pady=(0, 8))
+
         hour_var = tk.StringVar(value="07")
         minute_var = tk.StringVar(value="30")
-        # Подставляем время из основной формы будильника, если оно валидно
+        existing = self.alarm.get_monthly_alarms().get(date_str, [])
+        occupied = {(item["hour"], item["minute"]) for item in existing}
         try:
-            ph = int(self.alarm_hour_entry.get())
-            pm = int(self.alarm_minute_entry.get())
-            if 0 <= ph <= 23 and 0 <= pm <= 59:
-                hour_var.set(f"{ph:02d}")
-                minute_var.set(f"{pm:02d}")
-        except ValueError:
-            pass
-        
+            preferred = (int(self.alarm_hour_entry.get()), int(self.alarm_minute_entry.get()))
+        except (ValueError, AttributeError):
+            preferred = (7, 30)
+        if not (0 <= preferred[0] <= 23 and 0 <= preferred[1] <= 59) or preferred in occupied:
+            preferred_minutes = ((preferred[0] * 60 + preferred[1]) if 0 <= preferred[0] <= 23 and 0 <= preferred[1] <= 59 else 450)
+            preferred = next((((preferred_minutes + step * 5) // 60 % 24,
+                               (preferred_minutes + step * 5) % 60)
+                              for step in range(1, 289)
+                              if (((preferred_minutes + step * 5) // 60 % 24,
+                                   (preferred_minutes + step * 5) % 60) not in occupied)), (7, 30))
+        hour_var.set(f"{preferred[0]:02d}")
+        minute_var.set(f"{preferred[1]:02d}")
+
         hour_entry = tk.Entry(time_frame, width=3, font=("Segoe UI", 14, "bold"),
                               bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
                               insertbackground=self.accent, relief="flat",
                               highlightthickness=1, highlightbackground=self.card_border,
-                              highlightcolor=self.accent,
-                              textvariable=hour_var)
+                              highlightcolor=self.accent, textvariable=hour_var)
         hour_entry.pack(side="left")
-        
         tk.Label(time_frame, text=":", bg=self.frame_bg, fg=self.label_fg,
                  font=("Segoe UI", 14, "bold")).pack(side="left")
-        
         minute_entry = tk.Entry(time_frame, width=3, font=("Segoe UI", 14, "bold"),
                                 bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
                                 insertbackground=self.accent, relief="flat",
                                 highlightthickness=1, highlightbackground=self.card_border,
-                                highlightcolor=self.accent,
-                                textvariable=minute_var)
+                                highlightcolor=self.accent, textvariable=minute_var)
         minute_entry.pack(side="left", padx=(0, 10))
 
-        # Мелодия (используем текущую)
         sound = self._alarm_resolve_sound()
         tk.Label(time_dlg, text=f"Мелодия: {Path(sound).name if sound else 'не выбрана'}",
                  font=("Segoe UI", 9), bg=self.frame_bg, fg=self.label_fg).pack(anchor="w", padx=15)
-
-        # Кнопки
         btn_frame = tk.Frame(time_dlg, bg=self.frame_bg)
-        btn_frame.pack(fill="x", padx=15, pady=15)
-        
+        btn_frame.pack(fill="x", padx=15, pady=14)
+
         def on_ok():
             try:
-                hour = int(hour_var.get())
-                minute = int(minute_var.get())
-                if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-                    messagebox.showerror("Ошибка", "Неверное время")
-                    return
+                hour, minute = int(hour_var.get()), int(minute_var.get())
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError
             except ValueError:
-                messagebox.showerror("Ошибка", "Введите числа")
+                messagebox.showerror("Ошибка", "Введите время от 00:00 до 23:59")
                 return
             sound_path = self._alarm_resolve_sound()
             if not sound_path:
                 messagebox.showerror("Ошибка", "Сначала выберите мелодию в настройках")
                 return
             try:
-                self.alarm.set_monthly_alarm(date_obj, hour, minute, sound_path)
+                added = self.alarm.set_monthly_alarm(date_obj, hour, minute, sound_path)
             except AlarmError as exc:
                 messagebox.showerror("Ошибка", str(exc))
                 return
-            time_dlg.destroy()
+            if not added:
+                messagebox.showinfo("Будильник уже установлен", "На эту дату уже есть будильник на это время.")
+                return
+            render_alarms()
             render_callback()
             self._alarm_tick(force=True)
-        
-        def on_cancel():
+            hour_entry.focus_set()
+            hour_entry.selection_range(0, "end")
+
+        def on_close():
             time_dlg.destroy()
 
-        tk.Button(btn_frame, text="OK", command=on_ok,
-                  font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=6,
+        tk.Button(btn_frame, text="Добавить", command=on_ok,
+                  font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=6,
                   cursor="hand2", relief="flat", bg=self.accent, fg="white",
                   activebackground=self._lighten(self.accent, 0.2), activeforeground="white",
-                  highlightthickness=0).pack(side="left", padx=(0, 10))
-        tk.Button(btn_frame, text="Отмена", command=on_cancel,
-                  font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=6,
+                  highlightthickness=0).pack(side="left", padx=(0, 9))
+        tk.Button(btn_frame, text="Закрыть", command=on_close,
+                  font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=6,
                   cursor="hand2", relief="flat", bg=self.neutral_btn, fg=self.input_fg,
                   activebackground=self._darken(self.neutral_btn, 0.2), activeforeground=self.input_fg,
                   highlightthickness=0).pack(side="left")
 
     def _toggle_monthly_alarm(self, date_obj, date_str, refresh_callback):
-        """Клик по дню календаря: выключить будильник этого дня или включить.
-
-        Выключает — сразу удаляет; включает — открывает выбор времени.
-        Дни обновляются перекраской существующих кнопок (refresh_callback),
-        без пересборки сетки — иначе месяц мигает на каждое действие.
-        """
-        if date_str in self.alarm.get_monthly_alarms():
-            try:
-                self.alarm.set_monthly_alarm(date_obj, None, None)
-            except Exception as exc:
-                messagebox.showerror("Ошибка", f"Не удалось отменить будильник: {exc}")
-                return
-            refresh_callback()
-        else:
-            self._show_time_picker(date_obj, date_str, refresh_callback)
-        self._alarm_tick(force=True)
+        """Открывает список времён выбранного дня и форму добавления."""
+        self._show_time_picker(date_obj, date_str, refresh_callback)
 
     def _alarm_tick(self, force=False):
         """Раз в секунду: статус будильника, кнопка, трей и уведомление о звонке."""
