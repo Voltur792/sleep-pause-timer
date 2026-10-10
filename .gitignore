@@ -10,3 +10,4 @@ dist/
 # Environments
 .venv/
 venv/
+.tmp-*/

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ctypes
 import json
 import logging
 import math
@@ -12,6 +13,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from tkinter import ttk
+
+from timer_updates import installed_version, run_helper, UpdateController
+from timer_widgets import RoundedButton, RoundedEntry
+from timer_ui import build_interface, apply_palette, apply_colors, load_preferences, save_preferences, show_idle_warning, ACTION_TITLES
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--apply-update":
+    sys.exit(run_helper(sys.argv[2]))
 
 # Опциональные зависимости
 try:
@@ -69,93 +77,7 @@ def _idle_elapsed_ms(current_ticks, last_input_ticks):
     return (int(current_ticks) - int(last_input_ticks)) & 0xFFFFFFFF
 
 
-# ----------------- Theme helpers -----------------
-def apply_dark_theme(style: ttk.Style):
-    bg = "#0b1220"
-    fg = "#e2e8f0"
-    accent = "#7c83ff"
-    btn_bg = "#1e293b"
-    btn_hover = "#273449"
-    entry_bg = "#111827"
-    success = "#22c55e"
-    warning = "#f59e0b"
-    error = "#ef4444"
-    
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-    
-    style.configure(".", background=bg, foreground=fg, font=("Segoe UI", 10))
-    style.configure("TLabel", background=bg, foreground=fg, font=("Segoe UI", 10))
-    style.configure("TFrame", background=bg)
-    style.configure("TEntry", fieldbackground=entry_bg, foreground=fg, borderwidth=1)
-    style.configure("TButton", background=btn_bg, foreground=fg, borderwidth=0, font=("Segoe UI", 10, "bold"))
-    style.map("TButton",
-              background=[("active", btn_hover), ("pressed", accent)],
-              foreground=[("disabled", "#64748b")])
-    style.configure("TProgressbar", troughcolor="#1f2937", background=accent, borderwidth=0, thickness=10)
-    style.configure("TCombobox", 
-                    fieldbackground=entry_bg, 
-                    background=btn_bg, 
-                    foreground=fg,
-                    selectbackground=entry_bg,
-                    selectforeground=fg)
-    style.map("TCombobox", 
-              fieldbackground=[("readonly", entry_bg)],
-              background=[("readonly", btn_bg)],
-              foreground=[("readonly", fg)])
-
-    style._bg = bg
-    style._fg = fg
-    style._accent = accent
-    style._btn_bg = btn_bg
-    style._entry_bg = entry_bg
-    style._success = success
-
-def apply_light_theme(style: ttk.Style):
-    bg = "#f3f6fb"
-    fg = "#0f172a"
-    accent = "#5b6cff"
-    btn_bg = "#ffffff"
-    btn_hover = "#eef2ff"
-    entry_bg = "#ffffff"
-    success = "#22c55e"
-    warning = "#f59e0b"
-    error = "#ef4444"
-    
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-    
-    style.configure(".", background=bg, foreground=fg, font=("Segoe UI", 10))
-    style.configure("TLabel", background=bg, foreground=fg, font=("Segoe UI", 10))
-    style.configure("TFrame", background=bg)
-    style.configure("TEntry", fieldbackground=entry_bg, foreground=fg, borderwidth=1)
-    style.configure("TButton", background=btn_bg, foreground=fg, borderwidth=1, font=("Segoe UI", 10, "bold"))
-    style.map("TButton",
-              background=[("active", btn_hover), ("pressed", accent)],
-              foreground=[("disabled", "#94a3b8")])
-    style.configure("TProgressbar", troughcolor="#dbe4f3", background=accent, borderwidth=0, thickness=10)
-    style.configure("TCombobox", 
-                    fieldbackground=entry_bg, 
-                    background=btn_bg, 
-                    foreground=fg,
-                    selectbackground=entry_bg,
-                    selectforeground=fg)
-    style.map("TCombobox", 
-              fieldbackground=[("readonly", entry_bg)],
-              background=[("readonly", btn_bg)],
-              foreground=[("readonly", fg)])
-
-    style._bg = bg
-    style._fg = fg
-    style._accent = accent
-    style._btn_bg = btn_bg
-    style._entry_bg = entry_bg
-    style._success = success
-
+# ----------------- Icon -----------------
 def load_app_icon():
     base = os.path.dirname(os.path.abspath(__file__))
     png_path = os.path.join(base, APP_ICON_PNG)
@@ -863,7 +785,6 @@ class SleepPauseApp:
 
         # Theme
         self.style = ttk.Style()
-        apply_dark_theme(self.style)
         self.current_theme = "dark"
 
         # Отключаем takefocus для combobox через стиль
@@ -908,294 +829,18 @@ class SleepPauseApp:
         except Exception:
             pass
 
-        # UI (modern card style)
-        self.current_theme = "dark"
+        self.preferences_path = default_alarm_state_path().parent / "ui-settings.json"
+        self.preferences = load_preferences(self.preferences_path)
+        self.current_theme = self.preferences["theme"]
+        self.app_version = installed_version()
         self._pulse_after_id = None
         self._status_pulse_phase = 0.0
         self._button_anim_after_ids = {}
         self.button_roles = {}
-
         self._apply_theme_palette()
-        root.configure(bg=self.main_bg)
-        
-        # Главный контейнер
-        frm = tk.Frame(root, bg=self.main_bg, padx=20, pady=20)
-        frm.pack(fill="both", expand=True)
-        self.main_container = frm
-        
-        # Заголовок
-        self.title_label = tk.Label(
-            frm,
-            text="⏰ Sleep Pause Timer",
-            font=("Segoe UI", 17, "bold"),
-            bg=self.main_bg,
-            fg=self.accent,
-        )
-        self.title_label.pack(pady=(0, 14))
-
-        # Карточка времени
-        self.time_card = tk.Frame(frm, bg=self.frame_bg, padx=16, pady=14, highlightthickness=1)
-        self.time_card.configure(highlightbackground=self.card_border, highlightcolor=self.card_border)
-        self.time_card.pack(fill="x", pady=(0, 8))
-
-        self.time_shadow = tk.Frame(frm, bg=self.divider_color, height=1)
-        self.time_shadow.pack(fill="x", padx=6, pady=(0, 12))
-
-        time_labels_frame = tk.Frame(self.time_card, bg=self.frame_bg)
-        time_labels_frame.pack(fill="x")
-        time_labels_frame.columnconfigure(0, weight=1)
-        time_labels_frame.columnconfigure(1, weight=1)
-        time_labels_frame.columnconfigure(2, weight=1)
-        
-        tk.Label(time_labels_frame, text="Часы", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, padx=10)
-        tk.Label(time_labels_frame, text="Минуты", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9, "bold")).grid(row=0, column=1, padx=10)
-        tk.Label(time_labels_frame, text="Секунды", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9, "bold")).grid(row=0, column=2, padx=10)
-        
-        entry_frame = tk.Frame(self.time_card, bg=self.frame_bg)
-        entry_frame.pack(fill="x", pady=(6, 0))
-        entry_frame.columnconfigure(0, weight=1)
-        entry_frame.columnconfigure(1, weight=1)
-        entry_frame.columnconfigure(2, weight=1)
-        
-        self.entry_hour = tk.Entry(entry_frame, width=5, font=("Segoe UI", 14, "bold"),
-                                   bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
-                                   insertbackground=self.accent, relief="flat")
-        self.entry_hour.insert(0, DEFAULT_HOUR)
-        self.entry_hour.grid(row=0, column=0, padx=10, sticky="ew", ipady=6)
-
-        self.entry_min = tk.Entry(entry_frame, width=5, font=("Segoe UI", 14, "bold"),
-                                  bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
-                                  insertbackground=self.accent, relief="flat")
-        self.entry_min.insert(0, DEFAULT_MIN)
-        self.entry_min.grid(row=0, column=1, padx=10, sticky="ew", ipady=6)
-
-        self.entry_sec = tk.Entry(entry_frame, width=5, font=("Segoe UI", 14, "bold"),
-                                  bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
-                                  insertbackground=self.accent, relief="flat")
-        self.entry_sec.insert(0, DEFAULT_SEC)
-        self.entry_sec.grid(row=0, column=2, padx=10, sticky="ew", ipady=6)
-
-        # Карточка настроек
-        self.settings_card = tk.Frame(frm, bg=self.frame_bg, padx=16, pady=14, highlightthickness=1)
-        self.settings_card.configure(highlightbackground=self.card_border_accent, highlightcolor=self.card_border_accent)
-        self.settings_card.pack(fill="x", pady=(0, 8))
-
-        self.settings_shadow = tk.Frame(frm, bg=self.divider_color, height=1)
-        self.settings_shadow.pack(fill="x", padx=6, pady=(0, 12))
-
-        tk.Label(self.settings_card, text="⌨️ Клавиша для отправки", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w")
-        
-        self.key_var = tk.StringVar(value=KEY_OPTIONS[0])
-        self.combo = ttk.Combobox(self.settings_card, values=KEY_OPTIONS, textvariable=self.key_var,
-                                  state="readonly", width=25, font=("Segoe UI", 10, "bold"),
-                                  takefocus=0)
-        self.combo.pack(fill="x", pady=(5, 10))
-
-        # Отменяем выделение текста
-        self.combo.bind("<FocusIn>", lambda e: self.combo.after(1, lambda: self.combo.selection_clear()))
-
-        tk.Label(self.settings_card, text="🪟 Активировать окно", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w")
-        
-        self.win_title_entry = tk.Entry(self.settings_card, font=("Segoe UI", 10),
-                                         bg=self.entry_bg, fg=self.input_fg, bd=0, relief="flat")
-        self.win_title_entry.pack(fill="x", pady=(5, 0), ipady=5)
-
-        # --- Бездействие ---
-        tk.Label(self.settings_card, text="⏳ Бездействие (минуты, 0 = выкл)", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w", pady=(10, 0))
-        
-        idle_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
-        idle_frame.pack(fill="x", pady=(5, 0))
-        
-        self.idle_spin = tk.Spinbox(idle_frame, from_=1, to=120, width=5,
-                                     font=("Segoe UI", 10, "bold"), justify="center",
-                                     bg=self.entry_bg, fg=self.input_fg, bd=0,
-                                     relief="flat", takefocus=0)
-        self.idle_spin.insert(0, "0")
-        self.idle_spin.pack(side="left")
-        
-        self.idle_label = tk.Label(idle_frame, text="мин", bg=self.frame_bg,
-                                    fg=self.label_fg, font=("Segoe UI", 9))
-        self.idle_label.pack(side="left", padx=(4, 0))
-
-        # --- Будильник ---
-        tk.Label(self.settings_card, text="⏰ Будильник", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(anchor="w", pady=(10, 0))
-
-        alarm_time_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
-        alarm_time_frame.pack(fill="x", pady=(5, 0))
-
-        self.alarm_hour_entry = tk.Entry(alarm_time_frame, width=3, font=("Segoe UI", 11, "bold"),
-                                          bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
-                                          insertbackground=self.accent, relief="flat")
-        self.alarm_hour_entry.insert(0, "07")
-        self.alarm_hour_entry.pack(side="left")
-
-        tk.Label(alarm_time_frame, text=":", bg=self.frame_bg, fg=self.label_fg,
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
-
-        self.alarm_minute_entry = tk.Entry(alarm_time_frame, width=3, font=("Segoe UI", 11, "bold"),
-                                            bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
-                                            insertbackground=self.accent, relief="flat")
-        self.alarm_minute_entry.insert(0, "30")
-        self.alarm_minute_entry.pack(side="left", padx=(0, 10))
-
-        self.alarm_repeat_var = tk.BooleanVar(value=True)
-        self.alarm_repeat_check = tk.Checkbutton(
-            alarm_time_frame, text="Ежедневно", variable=self.alarm_repeat_var,
-            bg=self.frame_bg, fg=self.label_fg, font=("Segoe UI", 9),
-            activebackground=self.frame_bg, activeforeground=self.label_fg,
-            selectcolor=self.entry_bg, bd=0, takefocus=0, relief="flat",
-            highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-        self.alarm_repeat_check.pack(side="left", padx=(0, 10))
-
-        tk.Label(alarm_time_frame, text="Интервал", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(side="left")
-        self.alarm_interval_spin = tk.Spinbox(alarm_time_frame, from_=1, to=60, width=3,
-                                               font=("Segoe UI", 10, "bold"), justify="center",
-                                               bg=self.entry_bg, fg=self.input_fg, bd=0,
-                                               relief="flat", takefocus=0)
-        self.alarm_interval_spin.delete(0, "end")
-        self.alarm_interval_spin.insert(0, "5")
-        self.alarm_interval_spin.pack(side="left", padx=(4, 0))
-        tk.Label(alarm_time_frame, text="мин", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
-
-        # Дни недели
-        alarm_days_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
-        alarm_days_frame.pack(fill="x", pady=(5, 0))
-
-        self.alarm_days_vars = []
-        days_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-        tk.Label(alarm_days_frame, text="Дни:", bg=self.frame_bg,
-                 fg=self.label_fg, font=("Segoe UI", 9)).pack(side="left", padx=(0, 5))
-        for i, label in enumerate(days_labels):
-            var = tk.BooleanVar(value=True)
-            self.alarm_days_vars.append(var)
-            cb = tk.Checkbutton(
-                alarm_days_frame, text=label, variable=var,
-                bg=self.frame_bg, fg=self.label_fg, font=("Segoe UI", 8),
-                activebackground=self.frame_bg, activeforeground=self.label_fg,
-                selectcolor=self.entry_bg, bd=0, takefocus=0, relief="flat",
-                highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-            cb.pack(side="left", padx=2)
-
-        # Кнопка просмотра расписания на месяц
-        alarm_month_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
-        alarm_month_frame.pack(fill="x", pady=(5, 0))
-        self.btn_alarm_month = tk.Button(alarm_month_frame, text="📅 Расписание на месяц", command=self._show_alarm_month_schedule,
-                                          font=("Segoe UI", 9, "bold"), bd=0, padx=10, pady=4,
-                                          cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                          highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-        self.btn_alarm_month.pack(side="left")
-
-        # Мелодия будильника
-        alarm_sound_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
-        alarm_sound_frame.pack(fill="x", pady=(5, 0))
-
-        self.alarm_sound_entry = tk.Entry(alarm_sound_frame, font=("Segoe UI", 9),
-                                           bg=self.entry_bg, fg=self.input_fg, bd=0, relief="flat")
-        self.alarm_sound_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 6))
-
-        self.btn_alarm_sound = tk.Button(alarm_sound_frame, text="🎵 Мелодия", command=self._alarm_pick_sound,
-                                          font=("Segoe UI", 9, "bold"), bd=0, padx=10, pady=4,
-                                          cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                          highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-        self.btn_alarm_sound.pack(side="left")
-
-        # Кнопка будильника + статус
-        alarm_ctl_frame = tk.Frame(self.settings_card, bg=self.frame_bg)
-        alarm_ctl_frame.pack(fill="x", pady=(5, 0))
-
-        self.btn_alarm = tk.Button(alarm_ctl_frame, text="⏰ Установить", command=self._alarm_button_click,
-                                    font=("Segoe UI", 10, "bold"), bd=0, padx=12, pady=5,
-                                    cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                    highlightthickness=0, highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-        self.btn_alarm.pack(side="left")
-
-        self.alarm_status = tk.Label(alarm_ctl_frame, text="Будильник не установлен", bg=self.frame_bg,
-                                      fg=self.label_fg, font=("Segoe UI", 9))
-        self.alarm_status.pack(side="left", padx=(8, 0), fill="x", expand=True)
-
-        # Кнопки
-        self.btn_frame = tk.Frame(frm, bg=self.main_bg)
-        self.btn_frame.pack(fill="x", pady=(0, 10))
-        
-        self.btn_start = tk.Button(self.btn_frame, text="▶ Старт", command=self.start,
-                                   font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                   cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                   highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_start.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        
-        self.btn_idle = tk.Button(self.btn_frame, text="⏳ Бездействие", command=self.start_idle,
-                                  font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                  cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                  highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_idle.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        
-        self.btn_pause = tk.Button(self.btn_frame, text="⏸ Пауза", command=self.toggle_pause,
-                                   font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                   cursor="hand2", relief="flat", activeforeground="white", state="disabled", takefocus=0,
-                                   highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_pause.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        
-        self.btn_cancel = tk.Button(self.btn_frame, text="⏹ Отмена", command=self.cancel,
-                                    font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                    cursor="hand2", relief="flat", activeforeground="white", state="disabled", takefocus=0,
-                                    highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_cancel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        
-        self.btn_cancel_idle = tk.Button(self.btn_frame, text="⏹ Отмена", command=self.cancel_idle,
-                                         font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                         cursor="hand2", relief="flat", activeforeground="white", state="disabled", takefocus=0,
-                                         highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_cancel_idle.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        
-        self.btn_detect = tk.Button(self.btn_frame, text="🔍 Найти", command=self.detect_windows,
-                                    font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                    cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                    highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_detect.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        
-        self.btn_theme = tk.Button(self.btn_frame, text="🎨 Тема", command=self.toggle_theme,
-                                   font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=9, width=12, height=1,
-                                   cursor="hand2", relief="flat", activeforeground="white", takefocus=0,
-                                   highlightthickness=0, highlightbackground=self.main_bg, highlightcolor=self.main_bg)
-        self.btn_theme.pack(side="right", fill="both", expand=True)
-
-        self.button_roles = {
-            self.btn_start: "success",
-            self.btn_pause: "warning",
-            self.btn_cancel: "error",
-            self.btn_detect: "accent",
-            self.btn_theme: "neutral",
-            self.btn_idle: "warning",
-            self.btn_cancel_idle: "error",
-            self.btn_alarm: "accent",
-            self.btn_alarm_sound: "neutral",
-            self.btn_alarm_month: "neutral",
-        }
-        self._apply_button_palette()
-        self._bind_button_animations()
-
-        # Скрываем кнопку отмены бездействия по умолчанию
-        self.btn_cancel_idle.pack_forget()
-
-        # Статус + прогресс
-        self.status = tk.Label(frm, text="✓ Готово", bg=self.main_bg,
-                               fg=self.success, font=("Segoe UI", 10, "bold"))
-        self.status.pack(fill="x", pady=(4, 4))
-
-        self.progress = ttk.Progressbar(frm, orient="horizontal", length=100, mode="determinate")
-        self.progress.pack(fill="x", pady=(0, 0))
-
-        self.update_ui_colors()
-        self._set_status("✓ Готово", self.success, pulse=False)
+        build_interface(self)
+        self.updater = UpdateController(self)
+        self._set_status("Готово к запуску", self.success, pulse=False)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         # Кнопка «–» при активном таймере/отслеживании прячет окно в трей
         root.bind("<Unmap>", self._on_root_unmap)
@@ -1203,10 +848,8 @@ class SleepPauseApp:
         # Сброс кнопок при потере фокуса окном (клик на рабочий стол)
         root.bind("<FocusOut>", lambda e: self._reset_all_buttons())
         
-        # Сброс таймера бездействия при активности
-        root.bind("<Motion>", self._reset_idle_counter)
-        root.bind("<Key>", self._reset_idle_counter)
-        root.bind("<Button>", self._reset_idle_counter)
+        # Windows LASTINPUTINFO already tracks mouse and keyboard activity.
+        # Input events must not clear a stopped worker's cancellation event.
 
         # Поллер будильника: статус, кнопка, трей, уведомление о звонке
         self._alarm_tick(force=True)
@@ -1236,56 +879,16 @@ class SleepPauseApp:
         return self._mix_color(color, "#000000", amount)
 
     def _apply_theme_palette(self):
-        if self.current_theme == "dark":
-            self.main_bg = "#040812"
-            self.frame_bg = "#0e1625"
-            self.entry_bg = "#0a1322"
-            self.label_fg = "#9fb0c8"
-            self.input_fg = "#eef4ff"
-            self.card_border = "#2c3b55"
-            self.card_border_accent = "#394b6b"
-            self.accent = "#8aa2ff"
-            self.success = "#22c55e"
-            self.warning = "#f59e0b"
-            self.error = "#ef4444"
-            self.neutral_btn = "#1b2435"
-            self.divider_color = "#20304a"
-            self.title_subtle = "#b8c5da"
-            self.glow_color = "#6d8dff"
-            self.title_glow = "#9fb4ff"
-        else:
-            self.main_bg = "#edf3ff"
-            self.frame_bg = "#ffffff"
-            self.entry_bg = "#f7faff"
-            self.label_fg = "#56657c"
-            self.input_fg = "#0f172a"
-            self.card_border = "#ccdbf2"
-            self.card_border_accent = "#bfd2ef"
-            self.accent = "#3f61ff"
-            self.success = "#16a34a"
-            self.warning = "#d97706"
-            self.error = "#dc2626"
-            self.neutral_btn = "#dfe7f5"
-            self.divider_color = "#cdd9eb"
-            self.title_subtle = "#6f8099"
-            self.glow_color = "#7ea0ff"
-            self.title_glow = "#5f7fff"
-
-        self.button_palette = {
-            "accent": self.accent,
-            "success": self.success,
-            "warning": self.warning,
-            "error": self.error,
-            "neutral": self.neutral_btn,
-            "disabled": "#3b475d" if self.current_theme == "dark" else "#c7d3e3",
-        }
+        apply_palette(self)
 
     def _apply_button_palette(self):
         for button, role in self.button_roles.items():
             base_color = self.button_palette.get(role, self.accent)
-            fg = "#0f172a" if role == "neutral" and self.current_theme == "light" else "white"
-            if role == "neutral" and self.current_theme == "dark":
-                fg = "#e2e8f0"
+            fg = "#101722" if role in ("accent", "success") else self.input_fg
+            if role == "error":
+                fg = self.error
+            elif role == "warning":
+                fg = self.warning
 
             # Вычисляем glow-цвет (светлая обводка)
             glow_color = self._lighten(base_color, 0.35)
@@ -1303,67 +906,6 @@ class SleepPauseApp:
                 relief="flat",
             )
 
-    def _bind_button_animations(self):
-        for btn in self.button_roles.keys():
-            btn.bind("<Enter>", lambda e, b=btn: self._on_button_enter(b))
-            btn.bind("<Leave>", lambda e, b=btn: self._on_button_leave(b))
-            btn.bind("<ButtonPress-1>", lambda e, b=btn: self._on_button_press(b))
-            btn.bind("<ButtonRelease-1>", lambda e, b=btn: self._on_button_release(b))
-            # Сброс состояния при потере фокуса (клик на рабочий стол)
-            btn.bind("<FocusOut>", lambda e, b=btn: self._on_button_leave(b))
-
-    def _cancel_button_animation(self, button):
-        after_id = self._button_anim_after_ids.pop(button, None)
-        if after_id:
-            try:
-                self.root.after_cancel(after_id)
-            except Exception:
-                pass
-
-    def _animate_button_to(self, button, target_color, steps=6, delay=18):
-        if str(button.cget("state")) == "disabled":
-            return
-        self._cancel_button_animation(button)
-        start_color = button.cget("bg")
-
-        def step(i=1):
-            t = i / steps
-            cur = self._mix_color(start_color, target_color, t)
-            try:
-                button.config(bg=cur, activebackground=target_color)
-            except Exception:
-                return
-            if i < steps:
-                self._button_anim_after_ids[button] = self.root.after(delay, lambda: step(i + 1))
-            else:
-                self._button_anim_after_ids.pop(button, None)
-
-        step()
-
-    def _on_button_enter(self, button):
-        if str(button.cget("state")) != "disabled":
-            # Эффект поднятия кнопки при наведении
-            button.config(relief="raised")
-            self._animate_button_to(button, button._hover_bg)
-
-    def _on_button_leave(self, button):
-        if str(button.cget("state")) != "disabled":
-            # Возвращаем плоский вид
-            button.config(relief="flat")
-            self._animate_button_to(button, button._base_bg)
-
-    def _on_button_press(self, button):
-        if str(button.cget("state")) != "disabled":
-            # Эффект нажатия
-            button.config(relief="sunken")
-            self._animate_button_to(button, button._press_bg, steps=4, delay=14)
-
-    def _on_button_release(self, button):
-        if str(button.cget("state")) != "disabled":
-            # Возвращаем к состоянию "над кнопкой"
-            button.config(relief="raised")
-            self._animate_button_to(button, button._hover_bg, steps=4, delay=14)
-
     # ---------- Idle (бездействие) ----------
     def _ui_call(self, fn):
         """Безопасно планирует вызов в главном потоке Tk.
@@ -1376,12 +918,6 @@ class SleepPauseApp:
         except Exception:
             pass
 
-    def _reset_idle_counter(self, event=None):
-        """Сброс таймера бездействия при любом действии мыши/клавиатуры."""
-        if self.idle_alert_window is not None:
-            return  # уже показываем предупреждение — игнорируем
-        self.idle_stop_event.clear()
-
     def _start_idle_counter(self):
         """Запуск потока отслеживания бездействия."""
         idle_minutes = 0
@@ -1392,7 +928,8 @@ class SleepPauseApp:
         if idle_minutes <= 0:
             return  # функция отключена
         
-        self.idle_stop_event.clear()
+        # Each run owns its cancellation token; an old worker cannot resume.
+        stop_event = self.idle_stop_event = threading.Event()
         
         import ctypes
         
@@ -1412,9 +949,12 @@ class SleepPauseApp:
             # и без этой паузы приложение считало бы, что пользователь вернулся.
             action_cooldown_until = 0.0
             
-            while not self.idle_stop_event.is_set():
+            def ui(fn):
+                self._ui_call(lambda: fn() if not stop_event.is_set() else None)
+
+            while not stop_event.is_set():
                 # Ждём 1 секунду
-                if self.idle_stop_event.wait(1.0):
+                if stop_event.wait(1.0):
                     break  # остановка
                 
                 # Получаем время последнего ввода
@@ -1435,23 +975,23 @@ class SleepPauseApp:
                 # Если пользователь вернулся (реальная активность, не наш ввод) — сбрасываем флаг
                 if idle_secs < 2.0 and self.idle_action_executed and not in_cooldown:
                     self.idle_action_executed = False
-                    self._ui_call(lambda: self._set_status("✓ Вы вернулись — отслеживание продолжено", self.success, pulse=False))
+                    ui(lambda: self._set_status("✓ Вы вернулись — отслеживание продолжено", self.success, pulse=False))
                 
                 # Если предупреждение открыто и пользователь активен - закрываем его
                 if self.idle_alert_window is not None and idle_secs < 2.0 and not in_cooldown:
                     alert_ref = self.idle_alert_window
-                    self._ui_call(lambda: self._cancel_idle_alert(alert_ref))
+                    ui(lambda ref=alert_ref: self._cancel_idle_alert(ref))
                 
                 # Проверяем порог
                 if idle_secs >= idle_minutes * 60 and not self.idle_action_executed:
                     # Время бездействия истекло — выполняем действие
                     self.idle_action_executed = True  # Устанавливаем флаг ДО нажатия
                     action_cooldown_until = time.time() + 15  # игнорируем ввод 15 сек после действия
-                    self._ui_call(self._on_idle_timeout)
+                    ui(self._on_idle_timeout)
                     # Закрываем предупреждение если есть
                     if self.idle_alert_window is not None:
                         alert_ref = self.idle_alert_window
-                        self._ui_call(lambda: self._cancel_idle_alert(alert_ref))
+                        ui(lambda ref=alert_ref: self._cancel_idle_alert(ref))
                     continue
                 
                 # Показываем предупреждение за 5 минут до истечения
@@ -1460,7 +1000,8 @@ class SleepPauseApp:
                     time_left = (idle_minutes * 60) - idle_secs
                     if 0 < time_left <= 300:  # 5 минут = 300 сек
                         if self.idle_alert_window is None:
-                            self._ui_call(lambda: self._show_idle_alert(idle_minutes))
+                            self._idle_warning_remaining_secs = time_left
+                            ui(lambda: self._show_idle_alert(idle_minutes))
         
         self.idle_counter_thread = threading.Thread(target=thread, daemon=True)
         self.idle_counter_thread.start()
@@ -1490,7 +1031,7 @@ class SleepPauseApp:
             self.idle_alert_window = True  # маркер «предупреждение активно»
             try:
                 self.tray_icon.notify(
-                    f"Через 5 минут будет выполнено действие:\n{self.key_var.get()}\n\n"
+                    f"Скоро будет выполнено действие:\n{ACTION_TITLES.get(self.key_var.get(), self.key_var.get())}\n\n"
                     "Подвигайте мышь, чтобы отменить.",
                     "⏳ Sleep Pause Timer",
                 )
@@ -1498,74 +1039,13 @@ class SleepPauseApp:
                 print(f"DEBUG: tray notify error: {e}")
             return
         try:
-            # Звуковой сигнал
             try:
                 ctypes.windll.user32.MessageBeep(ctypes.c_uint(-1))
             except Exception:
                 pass
-            
-            # Создаём окно предупреждения
-            alert = tk.Toplevel(self.root)
-            alert.title("⏳ Предупреждение: бездействие")
-            alert.geometry("420x180")
-            alert.resizable(False, False)
-            alert.transient(self.root)
-            alert.grab_set()
-            alert.lift()
-            alert.focus_force()
-            
-            # Цвета
-            bg = self.frame_bg
-            fg = self.input_fg
-            accent = self.accent
-            warning = self.warning
-            
-            alert.configure(bg=bg)
-            
-            # Текст
-            tk.Label(alert, text="⚠️ Предупреждение", font=("Segoe UI", 14, "bold"),
-                     bg=bg, fg=warning).pack(pady=(15, 5))
-            
-            tk.Label(alert, text=f"Через 5 минут будет выполнено действие:\n{self.key_var.get()}",
-                     font=("Segoe UI", 10), bg=bg, fg=fg).pack(pady=5)
-            
-            tk.Label(alert, text="Подвигайте мышь или нажмите любую клавишу, чтобы отменить.",
-                     font=("Segoe UI", 9, "italic"), bg=bg, fg=self.label_fg).pack(pady=(5, 15))
-            
-            # Кнопки
-            btn_frame = tk.Frame(alert, bg=bg)
-            btn_frame.pack(pady=(0, 15))
-            
-            def on_cancel():
-                self.idle_alert_window = None
-                alert.destroy()
-            
-            def on_confirm():
-                self.idle_alert_window = None
-                alert.destroy()
-                # Сразу выполняем действие
-                self.root.after(0, self._on_idle_timeout)
-            
-            tk.Button(btn_frame, text="Отменить", command=on_cancel,
-                     font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8,
-                     cursor="hand2", relief="flat", bg="#1e293b", fg="white",
-                     activebackground=accent, activeforeground="white",
-                     highlightthickness=0, highlightbackground=bg, highlightcolor=bg).pack(side="left", padx=5)
-            
-            tk.Button(btn_frame, text="Выполнить сейчас", command=on_confirm,
-                     font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8,
-                     cursor="hand2", relief="flat", bg=warning, fg="white",
-                     activebackground=self._darken(warning, 0.2), activeforeground="white",
-                     highlightthickness=0, highlightbackground=bg, highlightcolor=bg).pack(side="left", padx=5)
-            
-            self.idle_alert_window = alert
-            
-            # Закрываем окно по активности (привязываем к окну предупреждения)
-            alert.bind("<Motion>", lambda e: self._cancel_idle_alert(alert))
-            alert.bind("<Key>", lambda e: self._cancel_idle_alert(alert))
-            
-        except Exception as e:
-            print(f"DEBUG: idle alert error: {e}")
+            show_idle_warning(self, idle_minutes)
+        except Exception as exc:
+            logging.warning("Cannot show inactivity warning: %s", exc)
 
     def _cancel_idle_alert(self, alert=None):
         """Отменяет предупреждение при активности."""
@@ -1586,6 +1066,9 @@ class SleepPauseApp:
 
     def _on_idle_timeout(self):
         """Выполняет действие при истечении времени бездействия."""
+        cancellation = self.idle_stop_event
+        if cancellation.is_set():
+            return
         self._set_status("⏳ Бездействие: действие выполняется...", self.warning, pulse=False)
         
         # Вызываем то же действие, что и при завершении таймера
@@ -1595,12 +1078,12 @@ class SleepPauseApp:
         # Выполняем действие
         if key == "shutdown":
             self.root.after(0, lambda: self._set_status("🔴 Выключение...", self.warning, pulse=False))
-            self.root.after(1000, lambda: ctypes.windll.user32.ExitWindowsEx(0x00000001 | 0x00000004, 0xFFFFFFFF))
+            self.root.after(1000, lambda: None if cancellation.is_set() else ctypes.windll.user32.ExitWindowsEx(0x00000001 | 0x00000004, 0xFFFFFFFF))
             return
         
         elif key == "sleep":
             self.root.after(0, lambda: self._set_status("💤 Спящий режим...", self.warning, pulse=False))
-            self.root.after(1000, lambda: ctypes.windll.PowrProf.SetSuspendState(0, 0, 0))
+            self.root.after(1000, lambda: None if cancellation.is_set() else ctypes.windll.PowrProf.SetSuspendState(0, 0, 0))
             return
         
         if pyautogui is None:
@@ -1609,6 +1092,8 @@ class SleepPauseApp:
         
         # Активируем окно и отправляем клавишу
         def send_key():
+            if cancellation.is_set():
+                return
             if title:
                 self._activate_window(title)
             
@@ -1693,103 +1178,18 @@ class SleepPauseApp:
         step()
 
     def toggle_theme(self):
-        if self.current_theme == "dark":
-            apply_light_theme(self.style)
-            self.current_theme = "light"
-        else:
-            apply_dark_theme(self.style)
-            self.current_theme = "dark"
+        self.current_theme = "light" if self.current_theme == "dark" else "dark"
         self._apply_theme_palette()
         self.update_ui_colors()
+        try:
+            save_preferences(self)
+        except OSError as exc:
+            logging.warning("Cannot save appearance settings: %s", exc)
 
     def update_ui_colors(self):
-        self.root.configure(bg=self.main_bg)
-        self.main_container.configure(bg=self.main_bg)
-        self.title_label.configure(bg=self.main_bg, fg=self.accent)
-        self.btn_frame.configure(bg=self.main_bg)
+        apply_colors(self)
 
-        self.time_card.configure(bg=self.frame_bg, highlightbackground=self.card_border, highlightcolor=self.card_border)
-        self.settings_card.configure(bg=self.frame_bg, highlightbackground=self.card_border_accent, highlightcolor=self.card_border_accent)
-        self.time_shadow.configure(bg=self.divider_color)
-        self.settings_shadow.configure(bg=self.divider_color)
-
-        for card in (self.time_card, self.settings_card):
-            for child in card.winfo_children():
-                try:
-                    if child.winfo_class() == "Frame":
-                        child.configure(bg=self.frame_bg)
-                        for nested in child.winfo_children():
-                            if nested.winfo_class() == "Label":
-                                nested.configure(bg=self.frame_bg, fg=self.label_fg)
-                    elif child.winfo_class() == "Label":
-                        child.configure(bg=self.frame_bg, fg=self.label_fg)
-                except Exception:
-                    pass
-
-        for entry in (self.entry_hour, self.entry_min, self.entry_sec, self.win_title_entry,
-                      self.alarm_hour_entry, self.alarm_minute_entry, self.alarm_sound_entry):
-            try:
-                entry.configure(
-                    bg=self.entry_bg,
-                    fg=self.input_fg if str(entry.cget("state")) != "disabled" else self.label_fg,
-                    insertbackground=self.accent,
-                    highlightthickness=1,
-                    highlightbackground=self.card_border,
-                    highlightcolor=self.accent,
-                )
-            except Exception:
-                pass
-
-        # Спинбоксы и чекбокс будильника под тему
-        for spin in (self.idle_spin, self.alarm_interval_spin):
-            try:
-                spin.configure(bg=self.entry_bg, fg=self.input_fg, buttonbackground=self.entry_bg,
-                               insertbackground=self.accent, highlightthickness=1,
-                               highlightbackground=self.card_border, highlightcolor=self.accent)
-            except Exception:
-                pass
-        try:
-            self.alarm_repeat_check.configure(
-                bg=self.frame_bg, fg=self.label_fg,
-                activebackground=self.frame_bg, activeforeground=self.label_fg,
-                selectcolor=self.entry_bg,
-                highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-        except Exception:
-            pass
-        # Дни недели чекбоксы под тему
-        try:
-            for cb in self.settings_card.winfo_children():
-                if isinstance(cb, tk.Frame):
-                    for child in cb.winfo_children():
-                        if isinstance(child, tk.Checkbutton) and child.cget("text") in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]:
-                            child.configure(
-                                bg=self.frame_bg, fg=self.label_fg,
-                                activebackground=self.frame_bg, activeforeground=self.label_fg,
-                                selectcolor=self.entry_bg,
-                                highlightbackground=self.frame_bg, highlightcolor=self.frame_bg)
-        except Exception:
-            pass
-
-        self._apply_button_palette()
-        self._set_button_state(self.btn_start, enabled=str(self.btn_start.cget("state")) != "disabled")
-        self._set_button_state(self.btn_pause, enabled=str(self.btn_pause.cget("state")) != "disabled")
-        self._set_button_state(self.btn_cancel, enabled=str(self.btn_cancel.cget("state")) != "disabled")
-
-        self.status.configure(bg=self.main_bg)
-        current_text = self.status.cget("text")
-        if "Осталось" in current_text or "Таймер" in current_text:
-            self._set_status(current_text, self.accent, pulse=True)
-        elif "Пауза" in current_text or "Отмена" in current_text:
-            self._set_status(current_text, self.warning, pulse=False)
-        elif "Ошибка" in current_text:
-            self._set_status(current_text, self.error, pulse=False)
-        else:
-            self._set_status(current_text, self.success, pulse=False)
-
-        # Статус будильника перекрашивается по своему состоянию (после общих Label)
-        self._alarm_tick(force=True)
-
-    # ---------- Start / Cancel / Pause ----------
+    # ---------- Timer ----------
     def start(self):
         key = self.key_var.get()
         # pyautogui не требуется для shutdown и sleep
@@ -1818,14 +1218,13 @@ class SleepPauseApp:
         self.progress["value"] = 0
         self._set_status("⏳ Таймер запущен", self.accent, pulse=True)
         
-        # Запускаем отслеживание бездействия
-        self._start_idle_counter()
-        
         self.worker = threading.Thread(target=self._timer_thread, args=(total, key), daemon=True)
         self.worker.start()
 
     def start_idle(self):
         """Запуск только отслеживания бездействия (без основного таймера)."""
+        if self.idle_counter_thread is not None and self.idle_counter_thread.is_alive():
+            return
         idle_minutes = 0
         try:
             idle_minutes = int(self.idle_spin.get())
@@ -1844,18 +1243,17 @@ class SleepPauseApp:
             return
         
         # Если выбрана команда shutdown/sleep — сразу запускаем бездействие
-        self.idle_stop_event.clear()
+        self.idle_action_executed = False
         self._set_button_state(self.btn_idle, enabled=False)
         self.btn_idle.config(text="⏳ Отслеживание...")
         
-        # Показываем кнопку отмены бездействия, скрываем кнопку отмены таймера
-        self.btn_cancel.pack_forget()
-        self.btn_cancel_idle.pack(side="left", padx=(0, 8), fill="both", expand=True)
+        self.btn_cancel_idle.pack(side="right", padx=(8, 0))
         self._set_button_state(self.btn_cancel_idle, enabled=True)
         
-        self.progress["maximum"] = 1
-        self.progress["value"] = 0
-        self._set_status("⏳ Отслеживание бездействия запущено", self.accent, pulse=True)
+        if not (self.worker and self.worker.is_alive()):
+            self.progress["maximum"] = 1
+            self.progress["value"] = 0
+            self._set_status("⏳ Отслеживание бездействия запущено", self.accent, pulse=True)
         
         self._start_idle_counter()
 
@@ -1866,24 +1264,15 @@ class SleepPauseApp:
             self._set_status("⏹ Отмена...", self.warning, pulse=False)
             self._set_button_state(self.btn_cancel, enabled=False)
         
-        # Останавливаем отслеживание бездействия
-        self._stop_idle_counter()
-        
-        # Скрываем кнопку отмены бездействия, показываем кнопку отмены таймера
-        self.btn_cancel_idle.pack_forget()
-        self.btn_cancel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-
     def cancel_idle(self):
         """Остановка отслеживания бездействия."""
         self._stop_idle_counter()
-        self._set_status("⏹ Бездействие отменено", self.warning, pulse=False)
+        if not (self.worker and self.worker.is_alive()):
+            self._set_status("⏹ Бездействие отменено", self.warning, pulse=False)
         self._set_button_state(self.btn_idle, enabled=True)
         self.btn_idle.config(text="⏳ Бездействие")
         
-        # Скрываем кнопку отмены бездействия, показываем кнопку отмены таймера
         self.btn_cancel_idle.pack_forget()
-        self.btn_cancel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        self._set_button_state(self.btn_cancel, enabled=False)
 
     def toggle_pause(self):
         if not self.worker or not self.worker.is_alive():
@@ -2098,7 +1487,7 @@ class SleepPauseApp:
                         continue  # Пустая ячейка
                     date_obj = datetime(nav["year"], nav["month"], day).date()
                     date_str = date_obj.isoformat()
-                    btn = tk.Button(grid_frame, text=str(day), width=5, height=2,
+                    btn = RoundedButton(grid_frame, text=str(day), width=5, height=2,
                                     bd=0, relief="flat", cursor="hand2", takefocus=0,
                                     activeforeground="white",
                                     highlightthickness=0, highlightbackground=self.frame_bg,
@@ -2129,19 +1518,19 @@ class SleepPauseApp:
                 nav["month"] += 1
             build_month()
 
-        tk.Button(nav_frame, text="◀", command=prev_month, width=3,
+        RoundedButton(nav_frame, text="◀", command=prev_month, width=3,
                   font=("Segoe UI", 10, "bold"), bd=0, padx=8, pady=4,
                   cursor="hand2", relief="flat", bg=self.neutral_btn, fg=self.input_fg,
                   takefocus=0, highlightthickness=0,
                   activebackground=self._darken(self.neutral_btn, 0.2), activeforeground=self.input_fg).pack(side="left")
 
-        tk.Button(nav_frame, text="Закрыть", command=dlg.destroy,
+        RoundedButton(nav_frame, text="Закрыть", command=dlg.destroy,
                   font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=4,
                   cursor="hand2", relief="flat", bg=self.accent, fg="white",
                   takefocus=0, highlightthickness=0,
                   activebackground=self._lighten(self.accent, 0.2), activeforeground="white").pack(side="left", padx=10)
 
-        tk.Button(nav_frame, text="▶", command=next_month, width=3,
+        RoundedButton(nav_frame, text="▶", command=next_month, width=3,
                   font=("Segoe UI", 10, "bold"), bd=0, padx=8, pady=4,
                   cursor="hand2", relief="flat", bg=self.neutral_btn, fg=self.input_fg,
                   takefocus=0, highlightthickness=0,
@@ -2184,7 +1573,7 @@ class SleepPauseApp:
                         render_alarms()
                         render_callback()
                         self._alarm_tick(force=True)
-                tk.Button(row, text="×", command=cancel_one, font=("Segoe UI", 10, "bold"),
+                RoundedButton(row, text="×", command=cancel_one, font=("Segoe UI", 10, "bold"),
                           bd=0, padx=8, pady=2, cursor="hand2", relief="flat",
                           bg=self.neutral_btn, fg=self.error,
                           activebackground=self._darken(self.neutral_btn, 0.15),
@@ -2214,7 +1603,7 @@ class SleepPauseApp:
         hour_var.set(f"{preferred[0]:02d}")
         minute_var.set(f"{preferred[1]:02d}")
 
-        hour_entry = tk.Entry(time_frame, width=3, font=("Segoe UI", 14, "bold"),
+        hour_entry = RoundedEntry(time_frame, width=3, font=("Segoe UI", 14, "bold"),
                               bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
                               insertbackground=self.accent, relief="flat",
                               highlightthickness=1, highlightbackground=self.card_border,
@@ -2222,7 +1611,7 @@ class SleepPauseApp:
         hour_entry.pack(side="left")
         tk.Label(time_frame, text=":", bg=self.frame_bg, fg=self.label_fg,
                  font=("Segoe UI", 14, "bold")).pack(side="left")
-        minute_entry = tk.Entry(time_frame, width=3, font=("Segoe UI", 14, "bold"),
+        minute_entry = RoundedEntry(time_frame, width=3, font=("Segoe UI", 14, "bold"),
                                 bg=self.entry_bg, fg=self.input_fg, bd=0, justify="center",
                                 insertbackground=self.accent, relief="flat",
                                 highlightthickness=1, highlightbackground=self.card_border,
@@ -2264,12 +1653,12 @@ class SleepPauseApp:
         def on_close():
             time_dlg.destroy()
 
-        tk.Button(btn_frame, text="Добавить", command=on_ok,
+        RoundedButton(btn_frame, text="Добавить", command=on_ok,
                   font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=6,
                   cursor="hand2", relief="flat", bg=self.accent, fg="white",
                   activebackground=self._lighten(self.accent, 0.2), activeforeground="white",
                   highlightthickness=0).pack(side="left", padx=(0, 9))
-        tk.Button(btn_frame, text="Закрыть", command=on_close,
+        RoundedButton(btn_frame, text="Закрыть", command=on_close,
                   font=("Segoe UI", 10, "bold"), bd=0, padx=16, pady=6,
                   cursor="hand2", relief="flat", bg=self.neutral_btn, fg=self.input_fg,
                   activebackground=self._darken(self.neutral_btn, 0.2), activeforeground=self.input_fg,
@@ -2657,7 +2046,8 @@ class SleepPauseApp:
 
     def _show_detect_dialog(self, titles):
         dlg = tk.Toplevel(self.root)
-        dlg.title("Detected windows")
+        dlg.title("Найденные окна")
+        dlg.configure(bg=self.frame_bg)
         dlg.geometry("700x400")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -2669,7 +2059,9 @@ class SleepPauseApp:
         frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical")
-        listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, selectmode="browse", font=("Segoe UI", 9))
+        listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, selectmode="browse", font=("Segoe UI", 9),
+                            bg=self.entry_bg, fg=self.input_fg, bd=0, highlightthickness=0,
+                            selectbackground=self.accent, selectforeground="#101722")
         scrollbar.config(command=listbox.yview)
         scrollbar.pack(side="right", fill="y")
         listbox.pack(side="left", fill="both", expand=True)
@@ -2707,11 +2099,11 @@ class SleepPauseApp:
         def close_dlg():
             dlg.destroy()
 
-        btn_use = ttk.Button(btn_frame, text="Использовать", command=use_selected)
+        btn_use = RoundedButton(btn_frame, text="Использовать", command=use_selected)
         btn_use.pack(side="left", padx=(0,6))
-        btn_copy = ttk.Button(btn_frame, text="Копировать заголовок", command=copy_selected)
+        btn_copy = RoundedButton(btn_frame, text="Копировать заголовок", command=copy_selected)
         btn_copy.pack(side="left", padx=(0,6))
-        btn_close = ttk.Button(btn_frame, text="Закрыть", command=close_dlg)
+        btn_close = RoundedButton(btn_frame, text="Закрыть", command=close_dlg)
         btn_close.pack(side="right")
 
     # ---------- Activation check (diagnostics) ----------
@@ -2928,6 +2320,7 @@ class SleepPauseApp:
 
     def _on_exit(self):
         self.stop_event.set()
+        self.idle_stop_event.set()
         # Будильник: глушим звонок и поток (расписание остаётся в alarm.json
         # и восстановится при следующем запуске)
         try:
